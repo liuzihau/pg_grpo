@@ -45,14 +45,13 @@ def cfg_get(obj, path, default):
     return cur
 
 def wb_init(cfg, cfg_raw):
-    use = cfg_get(cfg, "logging.use_wandb", False)
-    mode = cfg_get(cfg, "logging.mode", "disabled")
-    if (not use) or mode == "disabled":
-        return _NoopWB()
+    mode = cfg_get(cfg, "logging.mode", "online")
+
     run = wandb.init(
+        key=cfg_get(cfg, "logging.api_key", ""),
         project=cfg_get(cfg, "logging.project", "grpo-prefix-growth"),
         entity=cfg_get(cfg, "logging.entity", None),
-        name=cfg_get(cfg, "logging.run_name", None),
+        name=cfg_get(cfg, "logging.name", None),
         mode=mode,
         config=cfg_raw
     )

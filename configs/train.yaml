@@ -12,6 +12,7 @@ lora:
 
 training:
   dtype: "bf16"
+  num_epochs: 2
   batch_prompts: 2
   S: 2 #4
   K_chunk: 12
@@ -27,12 +28,17 @@ training:
   log_every: 10
   device: "cuda"
 
+eval:
+  enabled: true
+  every_epochs: 1
+
 reward:
   alpha_floor: 0.05
   use_overlap_alpha: false
   gamma_overlap: 0.1
 
 logging:
-  use_wandb: false
+  api_key: ""
   project: "grpo-prefix-growth"
+  name: "test"
   eval_every: 200
