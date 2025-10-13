@@ -1,0 +1,38 @@
+
+models:
+  target: "Qwen/Qwen3-0.6B"
+  draft:  "Qwen/Qwen3-0.6B"
+  tokenizer: "Qwen/Qwen3-0.6B"
+
+lora:
+  target_modules: ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj"]
+  r: 1 #32
+  alpha: 32
+  dropout: 0.05
+
+training:
+  dtype: "bf16"
+  batch_prompts: 2
+  S: 2 #4
+  K_chunk: 12
+  M: 128
+  temperature: 0.8
+  top_p: 0.9
+  kl_beta: 0.05
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  max_steps: 1000
+  seed: 1234
+  log_every: 10
+  device: "cuda"
+
+reward:
+  alpha_floor: 0.05
+  use_overlap_alpha: false
+  gamma_overlap: 0.1
+
+logging:
+  use_wandb: false
+  project: "grpo-prefix-growth"
+  eval_every: 200
