@@ -35,3 +35,12 @@ python train.py --config configs/train.yaml --prompts data/prompts.jsonl
 ```
 
 This demonstrates the full control flow and is a good starting point to scale up.
+
+
+## Instrumentation Added
+- **Weights & Biases** logging (toggle via `logging.use_wandb`).
+- **tqdm** progress bars for epochs and per-prompt steps.
+- **Evaluation phase** after each epoch with real speculative decoding:
+  - Logs real accepted prefix len per prompt.
+  - Logs per-position alpha up to `eval.K_eval_max`.
+  - Aggregates: mean/median/std acceptance length; per-position alpha means; macro/micro alpha means.
