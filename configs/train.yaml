@@ -1,3 +1,13 @@
+data:
+  source: "hf"
+  hf_name: "allenai/tulu-3-sft-mixture"
+  split: "train"
+  messages_field: "messages"   # default for tulu-3 mixture
+  sample_max: 5000             # or null for all
+  keep_history: true           # keep full context up to last user; set false for only the last user turn
+  # load_kwargs:
+  #   cache_dir: /your/cache
+
 
 models:
   target: "Qwen/Qwen3-0.6B"

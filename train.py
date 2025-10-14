@@ -3,34 +3,15 @@ from __future__ import annotations
 import argparse, math, random, statistics, os
 import torch, torch.nn.functional as F
 
+import wandb
+from tqdm.auto import tqdm
+
 from utils import load_yaml, set_seed, get_device, to_attrdict
-from data import PromptOnlyDataset
 from models import load_tokenizer, load_target, load_draft
 from lora_setup import attach_lora
 from rewards import accept_prob, survival as survival_fn
 from grpo import grpo_loss
 
-# --------- Optional tqdm ---------
-try:
-    from tqdm.auto import tqdm
-except Exception:
-    tqdm = None
-
-# --------- Optional W&B ---------
-class _NoopWB:
-    def __init__(self): self.run=None
-    def init(self, **kw): return self
-    def log(self, *a, **k): pass
-    def finish(self): pass
-    class Table:
-        def __init__(self, columns): self.columns=columns; self._rows=[]
-        def add_data(self, *row): self._rows.append(row)
-    class Histogram:
-        def __init__(self, arr): self.arr=list(arr)
-try:
-    import wandb
-except Exception:
-    wandb = _NoopWB()
 
 def cfg_get(obj, path, default):
     """Nested getattr for AttrDict/dict with default, using dotted path."""
@@ -46,9 +27,9 @@ def cfg_get(obj, path, default):
 
 def wb_init(cfg, cfg_raw):
     mode = cfg_get(cfg, "logging.mode", "online")
-
+    api_key=cfg_get(cfg, "logging.api_key", "")
+    wandb.login(key=api_key)
     run = wandb.init(
-        key=cfg_get(cfg, "logging.api_key", ""),
         project=cfg_get(cfg, "logging.project", "grpo-prefix-growth"),
         entity=cfg_get(cfg, "logging.entity", None),
         name=cfg_get(cfg, "logging.name", None),
@@ -63,6 +44,31 @@ def wb_log(d, step=None):
         else: wandb.log(d, step=step)
     except Exception:
         pass
+
+# --------- Data related -------
+def build_dataset_from_cfg(tok, cfg, default_prompts_path: str):
+    data_cfg = getattr(cfg, "data", None) or {}
+    source = getattr(data_cfg, "source", None) or data_cfg.get("source")
+    if source == "hf":
+        from data import HFChatPromptsDataset
+        name  = getattr(data_cfg, "hf_name", None) or data_cfg.get("hf_name") or "allenai/tulu-3-sft-mixture"
+        split = getattr(data_cfg, "split", None) or data_cfg.get("split") or "train"
+        field = getattr(data_cfg, "messages_field", None) or data_cfg.get("messages_field") or "messages"
+        sample_max   = getattr(data_cfg, "sample_max", None) or data_cfg.get("sample_max")
+        keep_history = getattr(data_cfg, "keep_history", True)
+        load_kwargs  = getattr(data_cfg, "load_kwargs", None) or data_cfg.get("load_kwargs")
+        return HFChatPromptsDataset(
+            dataset_name=name,
+            split=split,
+            tokenizer=tok,
+            messages_field=field,
+            sample_max=sample_max,
+            keep_history=keep_history,
+            load_kwargs=load_kwargs,
+        )
+    from data import PromptOnlyDataset
+    return PromptOnlyDataset(default_prompts_path)
+
 
 # --------- KV helpers ---------
 @torch.no_grad()
@@ -387,10 +393,9 @@ def main():
                             lr=cfg.training.lr, weight_decay=cfg.training.weight_decay, betas=(0.9, 0.95))
 
     # Data
-    ds = PromptOnlyDataset(args.prompts)
+    ds = build_dataset_from_cfg(tok, cfg, args.prompts)
     if len(ds) == 0:
         raise RuntimeError("Empty dataset. Put prompts in data/prompts.jsonl")
-
     # Epoch loop
     global_step = 0
     epochs = max(1, cfg_get(cfg, "training.num_epochs", 1))
@@ -403,10 +408,6 @@ def main():
 
     for epoch in range(1, epochs+1):
         prompt_indices = list(range(len(ds)))
-        limit = cfg_get(cfg, "training.batch_prompts", 0)
-        if limit and limit > 0:
-            prompt_indices = prompt_indices[:limit]
-
         inner_epoch_bar = None
         try:
             if cfg_get(cfg, "progress.use_tqdm", True) and tqdm is not None:
