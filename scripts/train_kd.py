@@ -14,14 +14,16 @@ except Exception as _e:
     USE_UNSLOTH = False
 
 import os, argparse, math,yaml
+from functools import partial
 from typing import Any, Dict
-import torch, torch.nn as nn
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-import wandb
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
+
+import wandb
 
 from src.data.pregen_kd_ds import PreGeneratedTopKDataset, collate_topk
 from src.kd.sparse_kd_loss import sparse_kd_kl
@@ -128,25 +130,23 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
-    def _collate(batch):
-        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-        # CPU only collate; no .to("cuda") here
-        return collate_topk(
-            batch,
-            pad_id=pad_id,
-            draft_dtype=torch.float32,   # keep workers on CPU-friendly dtype
-        )
+    # top-level, picklable collate (CPU only)
+    collate_fn = partial(
+        collate_topk,
+        pad_id=pad_id,
+        draft_dtype=torch.float32,   # keep workers on CPU dtype
+    )
 
 
     # draft model (Unsloth optional; fallback to PEFT)
-    try:
-        from unsloth import FastLanguageModel
+    if USE_UNSLOTH:
         quant_4bit = bool(cfg.lora.get("qlora", False))
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=cfg.draft.name,
             max_seq_length=cfg.data.max_input_len,
-            dtype=cfg.training.dtype,
+            dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")),  # use dtype=
             load_in_4bit=quant_4bit,
             device_map="auto",
         )
@@ -159,11 +159,11 @@ def main():
             bias="none",
             task_type="CAUSAL_LM",
         )
-    except Exception:
+    else:
         model = AutoModelForCausalLM.from_pretrained(
-            cfg.draft.name,
-            dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")),
-            device_map="auto",
+        cfg.draft.name,
+        dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")),
+        device_map="auto",
         )
         peft = LoraConfig(
             task_type="CAUSAL_LM",
@@ -196,10 +196,10 @@ def main():
         batch_size=int(cfg_get(cfg, "kd.batch_size", 4)),
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,                       # enables non_blocking H2D copies
+        pin_memory=True,
         persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,
-        collate_fn=_collate,
+        collate_fn=collate_fn,
         drop_last=True,
     )
 
@@ -218,6 +218,7 @@ def main():
         except StopIteration:
             it = iter(dl); batch = next(it)
 
+        # move to GPU here (parent process)
         for k, v in list(batch.items()):
             if torch.is_tensor(v):
                 batch[k] = v.to(device, non_blocking=True)
