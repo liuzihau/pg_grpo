@@ -9,6 +9,42 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
+
+# -----------------------------
+# Helper
+# -----------------------------
+def _pairs_from_cand(cand, tokenizer):
+    """
+    Normalize a single step's candidate logprobs into a list[(token_id:int, logprob:float)].
+    Supports vLLM 0.11 shapes:
+      - dict: { token(str|int) -> logprob(float) }
+      - list: [TokenLogprob(token_id=int, logprob=float), ...]
+    """
+    pairs = []
+    if isinstance(cand, dict):
+        for tk, lp in cand.items():
+            # tk may be int (already an ID) or str (a token string)
+            if isinstance(tk, int):
+                tid = tk
+            else:
+                try:
+                    tid = tokenizer.convert_tokens_to_ids(tk)
+                except Exception:
+                    # If something odd slips through, skip it safely
+                    continue
+            if tid is None or tid < 0:
+                continue
+            pairs.append((int(tid), float(lp)))
+    else:
+        # Assume iterable of objects with .token_id and .logprob
+        for c in cand:
+            tid = getattr(c, "token_id", None)
+            lp  = getattr(c, "logprob", None)
+            if tid is None or lp is None:
+                continue
+            pairs.append((int(tid), float(lp)))
+    return pairs
+
 # -----------------------------
 # YAML loader with `include:` support
 # -----------------------------
@@ -200,23 +236,16 @@ def main():
             step_topk_lps = []
             for step in range(len(token_ids)):
                 cand = token_logprobs[step]
-                pairs = []
-                if isinstance(cand, dict):
-                    for tk, lp in cand.items():
-                        tid = tokenizer.convert_tokens_to_ids(tk)
-                        if tid is not None and tid >= 0:
-                            pairs.append((tid, float(lp)))
-                else:
-                    for c in cand:
-                        pairs.append((c.token_id, float(c.logprob)))
-                pairs.sort(key=lambda x: x[1], reverse=True)
-                pairs = pairs[:K]
+                pairs = _pairs_from_cand(cand, tokenizer)
                 if not pairs:
                     continue
+                pairs.sort(key=lambda x: x[1], reverse=True)
+                pairs = pairs[:K]
                 ids = [p[0] for p in pairs]
                 lps = [p[1] for p in pairs]
                 step_topk_ids.append(ids)
                 step_topk_lps.append(lps)
+
 
             cont_len = len(step_topk_ids)
             if cont_len == 0:
