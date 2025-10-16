@@ -1,20 +1,21 @@
-
 from __future__ import annotations
-import argparse, math, random, statistics, os
-import torch, torch.nn.functional as F
+import argparse, os
+from typing import Dict, List
 
-import wandb
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from tqdm.auto import tqdm
+import wandb
 
 from utils import load_yaml, set_seed, get_device, to_attrdict
 from models import load_tokenizer, load_target, load_draft
 from lora_setup import attach_lora
-from rewards import accept_prob, survival as survival_fn
-from grpo import grpo_loss
+from trainer_hook import BoundaryGRPOHelper
+from collector_utils import compute_first_reject_mask
 
 
-def cfg_get(obj, path, default):
-    """Nested getattr for AttrDict/dict with default, using dotted path."""
+def cfg_get(obj, path, default=None):
     cur = obj
     for key in path.split("."):
         if hasattr(cur, key):
@@ -25,437 +26,255 @@ def cfg_get(obj, path, default):
             return default
     return cur
 
-def wb_init(cfg, cfg_raw):
-    mode = cfg_get(cfg, "logging.mode", "online")
-    api_key=cfg_get(cfg, "logging.api_key", "")
-    wandb.login(key=api_key)
-    run = wandb.init(
-        project=cfg_get(cfg, "logging.project", "grpo-prefix-growth"),
-        entity=cfg_get(cfg, "logging.entity", None),
-        name=cfg_get(cfg, "logging.name", None),
-        mode=mode,
-        config=cfg_raw
-    )
-    return wandb
 
-def wb_log(d, step=None):
-    try:
-        if step is None: wandb.log(d)
-        else: wandb.log(d, step=step)
-    except Exception:
-        pass
+def build_optimizer(model: nn.Module, cfg):
+    lr = cfg_get(cfg, "training.lr", 2e-4)
+    wd = cfg_get(cfg, "training.weight_decay", 0.01)
+    betas = cfg_get(cfg, "training.betas", (0.9, 0.95))
+    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, betas=betas)
 
-# --------- Data related -------
-def build_dataset_from_cfg(tok, cfg, default_prompts_path: str):
-    data_cfg = getattr(cfg, "data", None) or {}
+
+def _is_accelerate_dispatched(m) -> bool:
+    # Transformers sets this when using device_map / accelerate hooks.
+    return getattr(m, "hf_device_map", None) not in (None, {})
+
+def _move_if_needed(m, device):
+    # If model is already sharded/dispatched by accelerate (device_map), do NOT .to(device)
+    if _is_accelerate_dispatched(m):
+        return m
+    # BitsAndBytes 4/8-bit models are also typically device-mapped
+    if getattr(m, "is_loaded_in_8bit", False) or getattr(m, "is_loaded_in_4bit", False):
+        return m
+    return m.to(device)
+
+@torch.no_grad()
+def _top1_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    return logits.argmax(dim=-1)
+
+def _sample_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    if temperature <= 0:
+        return _top1_from_logits(logits)
+    probs = (logits / max(temperature, 1e-6)).softmax(dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+def _gather_logp(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    logp = logits.log_softmax(dim=-1)
+    return logp.gather(-1, ids.view(-1, 1)).squeeze(-1)
+
+def _append_tokens(input_ids: torch.Tensor, new_ids: torch.Tensor) -> torch.Tensor:
+    return torch.cat([input_ids, new_ids.view(-1, 1)], dim=1)
+
+def rollout_one(
+    *,
+    prompts: List[str],
+    tokenizer,
+    draft_model: nn.Module,
+    target_model: nn.Module,
+    device: torch.device,
+    temperature: float,
+    spec_window: int,
+    max_input_len: int,
+) -> Dict[str, torch.Tensor]:
+    # ---- COLLECT UNDER no_grad (no graphs kept) ----
+    with torch.no_grad():
+        enc = tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=max_input_len,
+            return_tensors="pt",
+        )
+        input_ids = enc["input_ids"].to(device)
+        attn_mask = enc["attention_mask"].to(device)
+        N, _ = input_ids.shape
+        T = spec_window
+
+        draft_logits_list, teacher_logits_list = [], []
+        accepted_mask = torch.zeros(T, N, device=device)
+        old_acts_logp_list = []
+        actions = torch.empty(T, N, dtype=torch.long, device=device)
+        rejected_seen = torch.zeros(N, dtype=torch.bool, device=device)
+
+        cur_ids, cur_attn = input_ids, attn_mask
+        draft_model.eval()   # eval for collection; we’ll train during recompute
+        target_model.eval()
+
+        # TODO sample and accept method should be alpha related 
+        for t in range(T):
+            d_out = draft_model(input_ids=cur_ids, attention_mask=cur_attn, use_cache=False)
+            d_logits = d_out.logits[:, -1, :]                 # [N,V]
+            probs = (d_logits / max(temperature, 1e-6)).softmax(-1)
+            sampled = torch.multinomial(probs, 1).squeeze(-1) # [N]
+            logp_old = d_logits.log_softmax(-1).gather(-1, sampled[:, None]).squeeze(-1)
+
+            t_out = target_model(input_ids=cur_ids, attention_mask=cur_attn, use_cache=False)
+            t_logits = t_out.logits[:, -1, :]
+
+            tgt_top1 = t_logits.argmax(-1)
+            step_accept = (tgt_top1 == sampled) & (~rejected_seen)
+            accepted_mask[t, step_accept] = 1.0
+            rejected_seen |= (~step_accept) & (~rejected_seen)
+
+            # extend prefix
+            cur_ids = torch.cat([cur_ids, sampled[:, None]], dim=1)
+            cur_attn = torch.cat([cur_attn, torch.ones(N, 1, device=device, dtype=cur_attn.dtype)], dim=1)
+
+            # store detached things for reward + replay
+            draft_logits_list.append(d_logits)   # detached by no_grad
+            teacher_logits_list.append(t_logits)
+            old_acts_logp_list.append(logp_old)
+            actions[t] = sampled
+
+        draft_logits   = torch.stack(draft_logits_list, dim=0)     # [T,N,V]
+        teacher_logits = torch.stack(teacher_logits_list, dim=0)   # [T,N,V]
+        first_reject_mask = compute_first_reject_mask(accepted_mask)
+
+        return {
+            "input_ids": enc["input_ids"].to(device),        # starting prefix (replay)
+            "attention_mask": enc["attention_mask"].to(device),
+            "draft_logits": draft_logits,                    # detached
+            "teacher_logits": teacher_logits,                # detached
+            "accepted_mask": accepted_mask,
+            "first_reject_mask": first_reject_mask,
+            "actions": actions,                               # [T,N] ints
+            "old_acts_logp": torch.stack(old_acts_logp_list).reshape(-1),  # [T*N], detached
+        }
+
+
+def build_dataset_from_cfg(tokenizer, cfg) -> List[str]:
+    """
+    Returns a list[str] prompts.
+    Fixes the HFValidationError by ensuring we pass a *string repo id* to datasets.load_dataset,
+    never the full config dict.
+    """
+    from data import PromptOnlyDataset, HFChatPromptsDataset
+
+    data_cfg = getattr(cfg, "data", {}) or {}
     source = getattr(data_cfg, "source", None) or data_cfg.get("source")
+
     if source == "hf":
-        from data import HFChatPromptsDataset
-        name  = getattr(data_cfg, "hf_name", None) or data_cfg.get("hf_name") or "allenai/tulu-3-sft-mixture"
-        split = getattr(data_cfg, "split", None) or data_cfg.get("split") or "train"
-        field = getattr(data_cfg, "messages_field", None) or data_cfg.get("messages_field") or "messages"
-        sample_max   = getattr(data_cfg, "sample_max", None) or data_cfg.get("sample_max")
+        name  = getattr(data_cfg, "hf_name", None) or data_cfg.get("hf_name")
+        if not isinstance(name, str):
+            raise ValueError(f"data.hf_name must be a string repo id like 'allenai/tulu-3-sft-mixture', got: {name!r}")
+        split = getattr(data_cfg, "split", "train")
+        field = getattr(data_cfg, "messages_field", "messages")
+        sample_max = getattr(data_cfg, "sample_max", None)
         keep_history = getattr(data_cfg, "keep_history", True)
-        load_kwargs  = getattr(data_cfg, "load_kwargs", None) or data_cfg.get("load_kwargs")
-        return HFChatPromptsDataset(
+        load_kwargs = getattr(data_cfg, "load_kwargs", None) or {}
+        ds = HFChatPromptsDataset(
             dataset_name=name,
             split=split,
-            tokenizer=tok,
+            tokenizer=tokenizer,
             messages_field=field,
             sample_max=sample_max,
             keep_history=keep_history,
             load_kwargs=load_kwargs,
         )
-    from data import PromptOnlyDataset
-    return PromptOnlyDataset(default_prompts_path)
+        return [rec["prompt"] for rec in ds]
 
+    # Fallback: local prompts.jsonl
+    prompts_path = cfg_get(cfg, "data.prompts_path", "data/prompts.jsonl")
+    ds = PromptOnlyDataset(prompts_path)
+    return [rec["prompt"] for rec in ds]
 
-# --------- KV helpers ---------
-@torch.no_grad()
-def init_kv(model, input_ids, attention_mask=None):
-    out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
-    return {"past": out.past_key_values, "attn": attention_mask, "last_tok": input_ids[:, -1:]}
-
-@torch.no_grad()
-def extend_kv(model, state, new_tokens):
-    out = model(input_ids=new_tokens, attention_mask=state["attn"], past_key_values=state["past"], use_cache=True)
-    state["past"] = out.past_key_values
-    state["last_tok"] = new_tokens[:, -1:]
-    return state
-
-@torch.no_grad()
-def ref_logp_on_path(ref_model, path_tokens, kv_state):
-    S, K = path_tokens.size()
-    step_kv = [kv_state["past"] for _ in range(S)]
-    attn = kv_state["attn"]
-    out_logp = torch.zeros((S, K), device=path_tokens.device)
-    for s in range(S):
-        for t in range(K):
-            tok = path_tokens[s:s+1, t:t+1]
-            out = ref_model(input_ids=tok, attention_mask=attn, past_key_values=step_kv[s], use_cache=True)
-            step_kv[s] = out.past_key_values
-            logp = F.log_softmax(out.logits[:, -1, :], dim=-1)
-            out_logp[s, t] = logp.gather(1, tok).squeeze(1)
-    return out_logp
-
-def nucleus_sample_probs(logits, top_p, temperature):
-    logits = logits / max(temperature, 1e-5)
-    probs = F.softmax(logits, dim=-1)
-    sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
-    cumprobs = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = (cumprobs > top_p).float().argmax(dim=-1)
-    vocab = probs.size(-1)
-    ar = torch.arange(vocab, device=probs.device).unsqueeze(0).expand_as(probs)
-    mask_sorted = ar > cutoff.unsqueeze(1)
-    mask_vocab = torch.zeros_like(mask_sorted, dtype=torch.bool)
-    mask_vocab.scatter_(1, sorted_idx, mask_sorted)
-    masked_probs = torch.where(mask_vocab, torch.zeros_like(probs), probs)
-    masked_probs = masked_probs / masked_probs.sum(dim=-1, keepdim=True)
-    return masked_probs
-
-def sample_S_chunks(draft, kv_state, S, K_chunk, temperature, top_p):
-    device = kv_state["last_tok"].device
-    step_kv = [kv_state["past"] for _ in range(S)]
-    attn = kv_state["attn"]
-    tokens = torch.empty((S, K_chunk), dtype=torch.long, device=device)
-    logps  = torch.empty((S, K_chunk), dtype=torch.float32, device=device)
-    last_inputs = [kv_state["last_tok"].clone() for _ in range(S)]
-
-    for t in range(K_chunk):
-        logits_rows = []
-        for s in range(S):
-            out = draft(input_ids=last_inputs[s], attention_mask=attn, past_key_values=step_kv[s], use_cache=True)
-            step_kv[s] = out.past_key_values
-            logits_rows.append(out.logits[:, -1, :])  # [1,V]
-        logits = torch.cat(logits_rows, dim=0)  # [S,V]
-        masked_probs = nucleus_sample_probs(logits, top_p, temperature)
-        next_tokens = torch.multinomial(masked_probs, num_samples=1)  # [S,1]
-        next_logp = torch.log(torch.gather(F.softmax(logits, dim=-1), 1, next_tokens).clamp_min(1e-12))  # [S,1]
-        for s in range(S):
-            tok = next_tokens[s:s+1, :]
-            out = draft(input_ids=tok, attention_mask=attn, past_key_values=step_kv[s], use_cache=True)
-            step_kv[s] = out.past_key_values
-            last_inputs[s] = tok
-        tokens[:, t:t+1] = next_tokens
-        logps[:, t:t+1] = next_logp
-
-    step_state = {"past": step_kv, "attn": attn, "last_tok": torch.stack([li.squeeze(0) for li in last_inputs], dim=0)}
-    return tokens, logps, step_state
-
-@torch.no_grad()
-def target_score_chunks(target, kv_state, prop_tokens):
-    S, K = prop_tokens.size()
-    step_kv = [kv_state["past"] for _ in range(S)]
-    attn = kv_state["attn"]
-    q_on_path = torch.empty((S, K), dtype=torch.float32, device=prop_tokens.device)
-    for s in range(S):
-        for t in range(K):
-            tok = prop_tokens[s:s+1, t:t+1]
-            out = target(input_ids=tok, attention_mask=attn, past_key_values=step_kv[s], use_cache=True)
-            step_kv[s] = out.past_key_values
-            logp = F.log_softmax(out.logits[:, -1, :], dim=-1)
-            q_on_path[s, t] = logp.gather(1, tok).exp().squeeze(1)
-    return q_on_path, {"past": step_kv, "attn": attn, "last_tok": prop_tokens[:, -1:].contiguous()}
-
-def train_on_prompt(prompt_ids, models, cfg, optim, tokenizer, global_step, pbar=None):
-    target, draft, ref_draft = models["target"], models["draft"], models["ref"]
-    S, K_chunk, M = cfg.training.S, cfg.training.K_chunk, cfg.training.M
-    beta = cfg.training.kl_beta
-    alpha_floor = cfg.reward.alpha_floor
-
-    attn = (prompt_ids != tokenizer.pad_token_id).long()
-    tgt_kv = init_kv(target, prompt_ids, attn)
-    drf_kv = init_kv(draft, prompt_ids, attn)
-    ref_kv = init_kv(ref_draft, prompt_ids, attn)
-
-    accepted = 0
-    steps = 0
-    inner_total = max(1, math.ceil(M / max(1, K_chunk)))
-    # inner tqdm
-    inner_bar = None
-    try:
-        if cfg_get(cfg, "progress.use_tqdm", True) and tqdm is not None and pbar is None:
-            inner_bar = tqdm(total=inner_total, leave=False, desc="prompt")
-    except Exception:
-        inner_bar = None
-
-    while accepted < M and steps < cfg.training.max_steps:
-        steps += 1; global_step += 1
-        # 1) Propose S chunks
-        prop_tokens, logp_draft, drf_step = sample_S_chunks(
-            draft, drf_kv, S, K_chunk, cfg.training.temperature, cfg.training.top_p
-        )
-
-        # 2) Target scoring
-        q_on_path, tgt_step = target_score_chunks(target, tgt_kv, prop_tokens)
-        p_on_path = logp_draft.exp().clamp_min(1e-12)
-
-        # 3) EAL reward + per-step acceptance lengths
-        a = accept_prob(p_on_path, q_on_path, floor=alpha_floor)  # [S,K]
-        surv = survival_fn(a)                                     # [S,K]
-        R = (surv * a).sum(dim=1)                                 # [S] = EAL per sequence
-        eal_mean = float(R.mean().detach().cpu())
-        eal_std  = float(R.std(unbiased=False).detach().cpu())
-        adv = (R - R.mean()).detach()
-
-        # 4) GRPO loss (+ KL)
-        ref_logp = ref_logp_on_path(ref_draft, prop_tokens, ref_kv)
-        loss, stats = grpo_loss(logp_draft, ref_logp, adv, surv, beta=beta)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(draft.parameters(), cfg.training.grad_clip)
-        optim.step(); optim.zero_grad(set_to_none=True)
-
-        # 5) Grow prefix (best-of-S) and compute observed acceptance len
-        s_best = int(torch.argmax(R))
-        a_best = a[s_best]             # [K]
-        tok_best = prop_tokens[s_best] # [K]
-        bern = torch.rand_like(a_best)
-        keep = (bern < a_best).float()
-        keep_prefix = torch.cumprod(keep + 1e-9, dim=0)
-        accepted_len = int((keep_prefix > 0).sum().item())
-
-        if accepted_len > 0:
-            ext = tok_best[:accepted_len].unsqueeze(0)  # [1,T]
-            tgt_kv = extend_kv(target, tgt_kv, ext)
-            drf_kv = extend_kv(draft, drf_kv, ext)
-            ref_kv = extend_kv(ref_draft, ref_kv, ext)
-            accepted += accepted_len
-
-        # ---- Logging ----
-        if (global_step % cfg_get(cfg, "logging.log_every", 10)) == 0:
-            wb_log({
-                "loss/total": float(stats["loss"]),
-                "loss/policy": float(stats["policy"]),
-                "loss/kl": float(stats["kl"]),
-                "reward/mean": eal_mean,
-                "reward/std":  eal_std,
-                # "average acceptance length within GRPO sequences":
-                "accept/eal_mean": eal_mean,
-                "accept/observed_len": accepted_len,
-                "accept/observed_total": accepted
-            }, step=global_step)
-
-        # tqdm progress
-        try:
-            if inner_bar is not None:
-                inner_bar.set_postfix({"acc_len": accepted_len, "acc_total": f"{accepted}/{M}", "loss": f"{float(stats['loss']):.3f}", "R": f"{eal_mean:.2f}"})
-                if accepted_len > 0:
-                    inner_bar.update(1)
-            if pbar is not None:
-                pbar.set_postfix_str(f"acc_total {accepted}/{M}")
-        except Exception:
-            pass
-
-    try:
-        if inner_bar is not None:
-            inner_bar.close()
-    except Exception:
-        pass
-    return global_step
-
-@torch.no_grad()
-def eval_specdec(prompts, tok, models, cfg):
-    """Real speculative decoding: 1 token at a time; record real accepted length and per-position alpha."""
-    target, draft = models["target"], models["draft"]
-    device = next(draft.parameters()).device
-    rnd = random.Random(cfg_get(cfg, "eval.seed", 12345))
-
-    idxs = list(range(len(prompts)))
-    rnd.shuffle(idxs)
-    num_prompts = cfg_get(cfg, "eval.num_prompts", 16)
-    if num_prompts and num_prompts > 0:
-        idxs = idxs[:num_prompts]
-
-    K = cfg_get(cfg, "eval.K_eval_max", 9)
-    accept_lens = []
-    alpha_pos_sum = torch.zeros(K, dtype=torch.float64, device=device)
-    alpha_pos_cnt = torch.zeros(K, dtype=torch.float64, device=device)
-    alpha_means_per_prompt = []
-
-    table = None
-    if cfg_get(cfg, "eval.log_alphas_table", True) and hasattr(wandb, "Table"):
-        table = wandb.Table(columns=["prompt_id", "pos", "alpha_t"])
-
-    for j, idx in enumerate(idxs):
-        enc = tok(prompts[idx], return_tensors="pt", add_special_tokens=False)
-        input_ids = enc["input_ids"].to(device)
-        attn = (input_ids != tok.pad_token_id).long()
-
-        tgt_kv = init_kv(target, input_ids, attn)
-        drf_kv = init_kv(draft,  input_ids, attn)
-
-        alphas = torch.full((K,), float('nan'), device=device, dtype=torch.float32)
-        real_len = 0
-        rejected = False
-
-        for t in range(K):
-            # Draft one token
-            out = draft(input_ids=drf_kv["last_tok"], attention_mask=drf_kv["attn"], past_key_values=drf_kv["past"], use_cache=True)
-            drf_kv["past"] = out.past_key_values
-            probs = F.softmax(out.logits[:, -1, :], dim=-1)
-            masked = nucleus_sample_probs(out.logits[:, -1, :], cfg_get(cfg, "eval.top_p", 0.9), cfg_get(cfg, "eval.temperature", 0.8))
-            tok_next = torch.multinomial(masked, num_samples=1)  # [1,1]
-
-            # p_t and q_t for that sampled token
-            p_t = probs.gather(1, tok_next).clamp_min(1e-12)  # [1,1]
-            out_t = target(input_ids=tok_next, attention_mask=tgt_kv["attn"], past_key_values=tgt_kv["past"], use_cache=True)
-            tgt_kv["past"] = out_t.past_key_values
-            q_t = F.softmax(out_t.logits[:, -1, :], dim=-1).gather(1, tok_next).clamp_min(1e-12)
-
-            a_t = torch.minimum(torch.ones_like(p_t), (q_t / p_t)).squeeze().float()
-            alphas[t] = a_t
-
-            # real accept decision
-            if not rejected:
-                u = torch.rand((), device=device)
-                if u < a_t:
-                    drf_kv = extend_kv(draft, drf_kv, tok_next)
-                    tgt_kv = extend_kv(target, tgt_kv, tok_next)
-                    real_len += 1
-                else:
-                    rejected = True
-                    if not cfg_get(cfg, "eval.continue_after_reject", True):
-                        break
-            # EOS handling
-            if cfg_get(cfg, "eval.stop_on_eos", True) and tok_next.item() == tok.eos_token_id:
-                break
-
-        accept_lens.append(real_len)
-        # aggregate per position
-        for t in range(K):
-            v = alphas[t].item()
-            if not (v != v):  # not NaN
-                alpha_pos_sum[t] += v
-                alpha_pos_cnt[t] += 1
-                if table is not None:
-                    table.add_data(idx, t+1, v)
-
-        finite_vals = alphas[~torch.isnan(alphas)]
-        if finite_vals.numel() > 0:
-            alpha_means_per_prompt.append(float(finite_vals.double().mean().cpu()))
-
-    # Aggregations
-    accept_len_mean = float(sum(accept_lens) / max(1, len(accept_lens)))
-    accept_len_median = float(statistics.median(accept_lens)) if accept_lens else 0.0
-    accept_len_std = float(statistics.pstdev(accept_lens)) if len(accept_lens) > 1 else 0.0
-    alpha_pos_mean = (alpha_pos_sum / torch.clamp(alpha_pos_cnt, min=1)).tolist()
-    alpha_mean_macro = float(sum(alpha_means_per_prompt) / max(1, len(alpha_means_per_prompt)))
-    total_alpha_sum = float(alpha_pos_sum.sum().cpu())
-    total_alpha_cnt = float(alpha_pos_cnt.sum().cpu())
-    alpha_mean_micro = (total_alpha_sum / max(1e-9, total_alpha_cnt)) if total_alpha_cnt > 0 else 0.0
-
-    metrics = {
-        "eval/accept_len_mean": accept_len_mean,
-        "eval/accept_len_median": accept_len_median,
-        "eval/accept_len_std": accept_len_std,
-        "eval/alpha_mean_macro": alpha_mean_macro,
-        "eval/alpha_mean_micro": alpha_mean_micro,
-    }
-    for i, m in enumerate(alpha_pos_mean, start=1):
-        metrics[f"eval/alpha_pos_mean/{i}"] = float(m)
-
-    if hasattr(wandb, "Histogram") and cfg_get(cfg, "logging.enable_hist", True):
-        try:
-            metrics["eval/accept_len_hist"] = wandb.Histogram(accept_lens)
-        except Exception:
-            pass
-
-    return metrics, table
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/train.yaml")
-    parser.add_argument("--prompts", type=str, default="data/prompts.jsonl")
+    parser.add_argument("--run_name", type=str, default="grpo_boundary")
+    parser.add_argument("--wandb_api_key", type=str, required=True)
     args = parser.parse_args()
 
-    cfg_raw = load_yaml(args.config)
-    cfg = to_attrdict(cfg_raw)
-    set_seed(cfg.training.seed)
-    device = get_device(cfg.training.device)
+    cfg = to_attrdict(load_yaml(args.config))
+    set_seed(cfg_get(cfg, "training.seed", 42))
+    device = get_device(cfg_get(cfg, "training.device", "cuda"))
+    os.makedirs(cfg_get(cfg, "training.output_dir", "./outputs"), exist_ok=True)
 
-    # W&B
-    wb = wb_init(cfg, cfg_raw)
+    # W&B login/init
+    wandb.login(key=args.wandb_api_key)
+    wandb.init(
+        project=cfg_get(cfg, "logging.project", "grpo-specdec"),
+        name=cfg_get(cfg, "logging.name", args.run_name),
+        config=dict(cfg),
+    )
 
-    # Load tokenizer, models
-    tok = load_tokenizer(cfg.models.tokenizer)
-    target = load_target(cfg.models.target, dtype=cfg.training.dtype, device=cfg.training.device)
-    draft  = load_draft(cfg.models.draft,  dtype=cfg.training.dtype, device=cfg.training.device)
-    draft = attach_lora(draft, cfg.lora.target_modules, cfg.lora.r, cfg.lora.alpha, cfg.lora.dropout)
-    draft.train()
+    # Tokenizer / model names
+    tok_name = cfg_get(cfg, "models.tokenizer", "Qwen/Qwen3-0.6B")
+    tgt_name = cfg_get(cfg, "models.target",   "Qwen/Qwen3-0.6B")
+    dft_name = cfg_get(cfg, "models.draft",    "Qwen/Qwen3-0.6B")
 
-    # Reference policy: frozen copy
-    import copy as _copy
-    ref_draft = _copy.deepcopy(draft).eval()
-    for p in ref_draft.parameters(): p.requires_grad_(False)
+    # Load
+    tokenizer = load_tokenizer(tok_name)
+    target = load_target(tgt_name, dtype=cfg_get(cfg, "training.dtype", "bf16"),
+                        device=cfg_get(cfg, "training.device", "cuda"))
+    draft  = load_draft(dft_name,  dtype=cfg_get(cfg, "training.dtype", "bf16"),
+                        device=cfg_get(cfg, "training.device", "cuda"))
 
-    # Optimizer
-    opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, draft.parameters()),
-                            lr=cfg.training.lr, weight_decay=cfg.training.weight_decay, betas=(0.9, 0.95))
+    # IMPORTANT: attach LoRA BEFORE doing any manual .to(device) (and avoid .to if device_map is set)
+    draft = attach_lora(draft, cfg)
 
-    # Data
-    ds = build_dataset_from_cfg(tok, cfg, args.prompts)
-    if len(ds) == 0:
-        raise RuntimeError("Empty dataset. Put prompts in data/prompts.jsonl")
-    # Epoch loop
-    global_step = 0
-    epochs = max(1, cfg_get(cfg, "training.num_epochs", 1))
-    outer_bar = None
-    try:
-        if cfg_get(cfg, "progress.use_tqdm", True) and tqdm is not None:
-            outer_bar = tqdm(total=epochs, desc="epochs")
-    except Exception:
-        outer_bar = None
+    # Now only move if not already accelerate-dispatched
+    device = get_device(cfg_get(cfg, "training.device", "cuda"))
+    target = _move_if_needed(target, device).eval()
+    for p in target.parameters():
+        p.requires_grad_(False)
 
-    for epoch in range(1, epochs+1):
-        prompt_indices = list(range(len(ds)))
-        inner_epoch_bar = None
-        try:
-            if cfg_get(cfg, "progress.use_tqdm", True) and tqdm is not None:
-                inner_epoch_bar = tqdm(total=len(prompt_indices), leave=False, desc=f"epoch {epoch}")
-        except Exception:
-            inner_epoch_bar = None
+    draft = _move_if_needed(draft, device)
 
-        for i in prompt_indices:
-            prompt = ds[i]["prompt"]
-            enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
-            input_ids = enc["input_ids"].to(device)
-            global_step = train_on_prompt(input_ids, {"target": target, "draft": draft, "ref": ref_draft},
-                                          cfg, opt, tok, global_step, pbar=inner_epoch_bar)
-            try:
-                if inner_epoch_bar is not None:
-                    inner_epoch_bar.update(1)
-            except Exception:
-                pass
+    optim = build_optimizer(draft, cfg)
 
-        try:
-            if inner_epoch_bar is not None:
-                inner_epoch_bar.close()
-        except Exception:
-            pass
+    # Prompts (HF or local)
+    prompts_all = build_dataset_from_cfg(tokenizer, cfg)
 
-        # ----- Evaluation phase -----
-        if cfg_get(cfg, "eval.enabled", True) and (epoch % max(1, cfg_get(cfg, "eval.every_epochs", 1)) == 0):
-            raw_prompts = [ds[i]["prompt"] for i in range(len(ds))]
-            metrics, table = eval_specdec(raw_prompts, tok, {"target": target, "draft": draft}, cfg)
-            wb_log(metrics)
-            if table is not None:
-                wb_log({"eval/alphas_table": table})
+    total_steps  = cfg_get(cfg, "training.max_steps", 1000)
+    batch_prompts= cfg_get(cfg, "training.batch_prompts", 2)
+    group_size   = cfg_get(cfg, "training.group_size", 4)
+    max_input_len= cfg_get(cfg, "data.max_input_len", 1024)
+    spec_window  = cfg_get(cfg, "training.S", 2)
+    temperature  = cfg_get(cfg, "training.temperature", 0.8)
 
-        try:
-            if outer_bar is not None:
-                outer_bar.update(1)
-        except Exception:
-            pass
+    helper = BoundaryGRPOHelper(cfg, draft_module=draft, optim=optim)
 
-    try:
-        if outer_bar is not None:
-            outer_bar.close()
-    except Exception:
-        pass
-    try:
-        wandb.finish()
-    except Exception:
-        pass
+    pbar = tqdm(range(total_steps), desc="Training", dynamic_ncols=True)
+    for step in pbar:
+        # sample prompts
+        if len(prompts_all) < batch_prompts:
+            raise RuntimeError(f"Not enough prompts ({len(prompts_all)}) for batch_prompts={batch_prompts}")
+        batch = prompts_all[step * batch_prompts % len(prompts_all) : (step + 1) * batch_prompts % len(prompts_all)]
+        if len(batch) < batch_prompts:
+            # wrap-around
+            batch = (prompts_all[(step * batch_prompts) % len(prompts_all):] +
+                     prompts_all[:batch_prompts - len(batch)])
+
+        # collect GRPO group
+        group = [
+            rollout_one(
+                prompts=batch,
+                tokenizer=tokenizer,
+                draft_model=draft,
+                target_model=target,
+                device=device,
+                temperature=temperature,
+                spec_window=spec_window,
+                max_input_len=max_input_len,
+            )
+            for _ in range(group_size)
+        ]
+
+        metrics = helper.step_on_group(group=group, step=step, log_fn=wandb.log)
+        pbar.set_postfix(
+            R=f'{metrics["train/seq_reward_mean"]:.3f}',
+            KL=f'{metrics["train/ppo_approx_kl"]:.4f}',
+            clip=f'{metrics["train/ppo_clipfrac"]:.2f}',
+        )
+
+        if step > 0 and step % cfg_get(cfg, "training.save_every", 1000) == 0:
+            outdir = cfg_get(cfg, "training.output_dir", "./outputs")
+            ckpt = os.path.join(outdir, f"draft_step{step}.pt")
+            torch.save({"step": step, "model": draft.state_dict(), "opt": optim.state_dict()}, ckpt)
+
+    wandb.finish()
+
 
 if __name__ == "__main__":
     main()

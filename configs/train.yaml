@@ -1,54 +1,76 @@
-data:
-  source: "hf"
-  hf_name: "allenai/tulu-3-sft-mixture"
-  split: "train"
-  messages_field: "messages"   # default for tulu-3 mixture
-  sample_max: 5000             # or null for all
-  keep_history: true           # keep full context up to last user; set false for only the last user turn
-  # load_kwargs:
-  #   cache_dir: /your/cache
-
-
 models:
-  target: "Qwen/Qwen3-0.6B"
-  draft:  "Qwen/Qwen3-0.6B"
-  tokenizer: "Qwen/Qwen3-0.6B"
+  tokenizer: Qwen/Qwen3-0.6B
+  target:    Qwen/Qwen3-8B
+  draft:     Qwen/Qwen3-0.6B
+
+data:
+  source: hf
+  hf_name: allenai/tulu-3-sft-mixture
+  split: train
+  messages_field: messages
+  sample_max: 50000
+  keep_history: true
+  max_input_len: 1024
 
 lora:
-  target_modules: ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj"]
-  r: 1 #32
+  target_modules: ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj"]
+  r: 32
   alpha: 32
   dropout: 0.05
+  task_type: "CAUSAL_LM"
 
 training:
-  dtype: "bf16"
-  num_epochs: 2
-  batch_prompts: 2
-  S: 2 #4
-  K_chunk: 12
-  M: 128
-  temperature: 0.8
-  top_p: 0.9
-  kl_beta: 0.05
+  project: specdec-two-stage
+  device: cuda
+  dtype: bf16
+  seed: 1234
   lr: 1.0e-4
   weight_decay: 0.01
-  grad_clip: 1.0
-  max_steps: 1000
-  seed: 1234
-  log_every: 10
-  device: "cuda"
+  max_grad_norm: 1.0
+  group_size: 4
+  ppo_clip_eps: 0.2
+  S: 2
+  batch_prompts: 2
+  temperature: 0.8
+  save_every: 2000
+  output_dir: outputs
+
+kd:
+  total_steps: 4000
+  batch_size: 4
+  log_every: 1
+  temperature: 0.0
+  margin_gamma: 1.5
+  mismatch_lambda: 0.5
+  curriculum:
+    max_input_len_start: 512
+    max_input_len_end: 2048
+    max_new_tokens_start: 128
+    max_new_tokens_end: 512
+
+grpo:
+  total_steps: 30000
+
+reward:
+  divergence: kl
+  alpha: 0.5
+  topk_for_ce: 0
+  entropy_bonus: 0.003
+  anchor_kl_beta: 0.03
+  clip_reward: true
+  clip_range: [-20.0, 0.0]
+  advantage_norm: std
 
 eval:
   enabled: true
-  every_epochs: 1
-
-reward:
-  alpha_floor: 0.05
-  use_overlap_alpha: false
-  gamma_overlap: 0.1
+  n_prompts: 64          # how many prompts to eval
+  gen_tokens: 128        # continuation length for eval
+  every_steps_kd: 200    # evaluate every K KD steps
+  every_steps_grpo: 1000 # evaluate every K GRPO steps
+  split: validation      # for HF datasets; fallbacks provided
+  temperature: 0.0       # greedy eval
+  prompts_path: null     # (optional) local path for eval prompts if not using HF
 
 logging:
-  api_key: ""
-  project: "grpo-prefix-growth"
-  name: "test"
-  eval_every: 200
+  project: specdec-two-stage
+  name: qwen0p6_to_8b_lora_two_stage
