@@ -1,5 +1,6 @@
 from __future__ import annotations
-import os, argparse, math
+import os, argparse, math,yaml
+from typing import Any, Dict
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -11,14 +12,53 @@ from peft import LoraConfig, get_peft_model
 from src.data.pregen_kd_ds import PreGeneratedTopKDataset, collate_topk
 from src.kd.sparse_kd_loss import sparse_kd_kl
 
+def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(a.get(k), dict):
+            a[k] = _deep_update(a[k], v)
+        else:
+            a[k] = v
+    return a
+
+def load_yaml_with_includes(path: str) -> Dict[str, Any]:
+    base_dir = os.path.dirname(os.path.abspath(path))
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+    includes = cfg.pop("include", []) or []
+    merged: Dict[str, Any] = {}
+    for rel in includes:
+        inc_path = rel if os.path.isabs(rel) else os.path.join(base_dir, rel)
+        sub = load_yaml_with_includes(inc_path)
+        _deep_update(merged, sub)
+    _deep_update(merged, cfg)
+    return merged
+
+class Attr(dict):
+    __getattr__ = dict.get
+    __setattr__ = dict.__setitem__
+
+def to_attrdict(d: Dict[str, Any]) -> Any:
+    a = Attr()
+    for k, v in d.items():
+        a[k] = to_attrdict(v) if isinstance(v, dict) else v
+    return a
+
+def cfg_get(obj, path: str, default=None):
+    cur = obj
+    for key in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        else:
+            cur = getattr(cur, key, None)
+        if cur is None:
+            return default
+    return cur
+
 def load_yaml(path):
     import yaml
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
-class Attr(dict):
-    __getattr__ = dict.get
-    __setattr__ = dict.__setitem__
 
 def to_attr(d): return Attr(d)
 
@@ -27,8 +67,8 @@ def set_seed(seed: int):
     random.seed(seed); torch.manual_seed(seed)
 
 def build_optimizer(model, cfg):
-    lr = cfg.kd.get("lr", 5e-4)
-    wd = cfg.kd.get("weight_decay", 0.0)
+    lr = float(cfg_get(cfg, "kd.lr", 5e-4))
+    wd = float(cfg_get(cfg, "kd.weight_decay", 0.0))
     betas = tuple(cfg.kd.get("betas", [0.9, 0.95]))
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, betas=betas)
 
@@ -46,9 +86,11 @@ def main():
     ap.add_argument("--wandb_api_key", required=True)
     args = ap.parse_args()
 
-    cfg = to_attr(load_yaml(args.config))
+    # new:
+    raw = load_yaml_with_includes(args.config)
+    cfg  = to_attrdict(raw)
     set_seed(int(cfg.training.seed))
-    device = torch.device(cfg.training.get("device", "cuda"))
+    device = torch.device(cfg_get(cfg, "training.device", "cuda"))
 
     # wandb
     wandb.login(key=args.wandb_api_key)
@@ -110,7 +152,7 @@ def main():
     model.train()
 
     # data
-    ds = PreGeneratedTopKDataset(cfg.kd.pregen_dir)
+    ds = PreGeneratedTopKDataset(cfg_get(cfg, "kd.pregen_dir", "data/kd_corpus/qwen8b_S64_topk64"))
     pad_id = tokenizer.pad_token_id
 
     def _collate(batch):
@@ -122,7 +164,7 @@ def main():
     optim = build_optimizer(model, cfg)
     sched = make_sched(optim, int(cfg.kd.total_steps), cfg.kd.get("warmup_ratio", 0.05))
 
-    total_steps = int(cfg.kd.total_steps)
+    total_steps = int(cfg_get(cfg, "kd.total_steps", 2000))
     log_every = int(cfg.kd.log_every)
 
     pbar = tqdm(range(total_steps), desc="KD (top-K)", ncols=100)
