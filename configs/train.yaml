@@ -12,6 +12,19 @@ data:
   keep_history: true
   max_input_len: 1024
 
+kd_pregen:
+  out_dir: data/kd_corpus/qwen8b_S64_temp0   # where to store shards + teacher_head.pt
+  num_samples: 10000                         # 4k–20k as you said
+  shard_size: 2000                           # items per .pt
+  S: 64                                      # continuation length to generate
+  split: train                               # which split to draw prompts from
+  seed: 1234
+
+  # generation settings (defaults fall back to kd.* if omitted)
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+
 lora:
   target_modules: ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj"]
   r: 32
@@ -36,12 +49,19 @@ training:
   output_dir: outputs
 
 kd:
+  use_pregen: true
+  pregen_dir: data/kd_corpus/qwen8b_S64_temp0
+  lr: 5.0e-4
+  weight_decay: 0.0
+  warmup_ratio: 0.05
+  margin_gamma: 0.5
+  margin_center: 1.0
+  w_min: 0.2
+  mismatch_lambda: 0.3
   total_steps: 4000
   batch_size: 4
   log_every: 1
   temperature: 0.0
-  margin_gamma: 1.5
-  mismatch_lambda: 0.5
   curriculum:
     max_input_len_start: 512
     max_input_len_end: 2048
@@ -74,3 +94,4 @@ eval:
 logging:
   project: specdec-two-stage
   name: qwen0p6_to_8b_lora_two_stage
+

@@ -1,0 +1,1 @@
+python generate_kd_corpus.py --config configs/train.yaml

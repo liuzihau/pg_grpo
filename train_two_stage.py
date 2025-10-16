@@ -14,6 +14,7 @@ import torch.nn as nn
 from tqdm.auto import tqdm
 import wandb
 
+from pregen_kd import PreGeneratedKDDataset, TeacherHead, collate_pregen_kd, kd_step_pregen
 from utils import load_yaml, set_seed, get_device, to_attrdict
 from data import HFChatPromptsDataset, PromptOnlyDataset
 from models import load_tokenizer, load_target, load_draft
@@ -387,7 +388,7 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
-    
+
     for m in (target, draft):
         if getattr(m.config, "pad_token_id", None) is None:
             m.config.pad_token_id = tokenizer.pad_token_id
@@ -462,6 +463,8 @@ def main():
     kd_steps = cfg_get(cfg, "kd.total_steps", 2000)
     kd_batch = cfg_get(cfg, "kd.batch_size", 4)
     kd_log_every = cfg_get(cfg, "kd.log_every", 20)
+    use_pregen = bool(cfg_get(cfg, "kd.use_pregen", False))
+    pregen_dir = cfg_get(cfg, "kd.pregen_dir", None)
 
     kd_weights = KDWeights(
         margin_gamma=cfg_get(cfg, "kd.margin_gamma", 0.5),
@@ -479,48 +482,87 @@ def main():
         temperature=float(cfg_get(cfg, "kd.temperature", 0.0)),
     )
 
-    pbar = tqdm(range(kd_steps), desc="KD/SFT", dynamic_ncols=True)
-    for step in pbar:
-        max_input_len, max_new_tokens = curriculum.at(step)
-        # wrap-around sampling
-        start = (step * kd_batch) % len(prompts_all)
-        end = start + kd_batch
-        batch_prompts = prompts_all[start:end] if end <= len(prompts_all) else (prompts_all[start:] + prompts_all[:(end % len(prompts_all))])
+    optim = build_optimizer_kd(draft, cfg)
+    scheduler = make_warmup_cosine_scheduler(
+        optim, total_steps=cfg_get(cfg, "kd.total_steps", 2000),
+        warmup_ratio=cfg_get(cfg, "kd.warmup_ratio", 0.05)
+    )
 
-        metrics = kd_step(
-            tokenizer=tokenizer,
-            draft=draft,
-            target=target,
-            optimizer=optim,
-            prompts=batch_prompts,
+    if use_pregen:
+        # ---- OFFLINE KD ----
+        if not pregen_dir or not os.path.isdir(pregen_dir):
+            raise RuntimeError("kd.use_pregen=True but kd.pregen_dir is missing or not a directory.")
+        # teacher head
+        th_path = os.path.join(pregen_dir, "teacher_head.pt")
+        th_sd = torch.load(th_path, map_location="cpu")
+        teacher_head = TeacherHead(
+            th_sd["weight"], th_sd.get("bias", None),
+            dtype=getattr(draft, "dtype", None) or torch.bfloat16,
             device=device,
-            kd_cfg=kd_cfg,
-            kd_weights=kd_weights,
-            max_input_len=max_input_len,
-            max_new_tokens=max_new_tokens,
         )
-        scheduler.step()
-        if step % kd_log_every == 0:
-            wandb.log({**metrics, "train/curr_max_in": max_input_len, "train/curr_max_new": max_new_tokens,
-                       "train/lr": scheduler.get_last_lr()[0]}, step=step)
-            pbar.set_postfix(loss=f'{metrics["train/kd_total_loss"]:.3f}', cont=f'{metrics["train/avg_cont_len"]:.1f}')
+        # dataset + loader
+        ds = PreGeneratedKDDataset(pregen_dir)
+        def _collate(batch):
+            return collate_pregen_kd(batch, pad_id=tokenizer.pad_token_id, device=device, target_dtype=teacher_head.weight.dtype)
+        dl = torch.utils.data.DataLoader(ds, batch_size=kd_batch, shuffle=True, drop_last=False, num_workers=2, pin_memory=True, collate_fn=_collate)
 
-        # ---- KD evaluation ----
-        if eval_enabled and (step % max(1, eval_every_kd) == 0):
-            draft.eval()
+        pbar = tqdm(range(kd_steps), desc="KD/SFT (pregen)", dynamic_ncols=True)
+        it = iter(dl)
+        for step in pbar:
             try:
-                kd_eval = eval_kd_alignment(
-                    tokenizer=tokenizer,
-                    draft=draft,
-                    target=target,
-                    device=device,
-                    prompts=eval_subset,
-                    max_input_len=eval_max_in,
-                    gen_tokens=eval_gen,
-                )
-                wandb.log(kd_eval, step=step)
-            finally:
-                draft.train()
+                batch = next(it)
+            except StopIteration:
+                it = iter(dl)
+                batch = next(it)
+            metrics = kd_step_pregen(
+                draft=draft,
+                teacher_head=teacher_head,
+                batch=batch,
+                optimizer=optim,
+                kd_cfg=kd_cfg,
+                kd_weights=k d_weights,
+            )
+            scheduler.step()
+            if step % kd_log_every == 0:
+                wandb.log({**metrics, "train/lr": scheduler.get_last_lr()[0]}, step=step)
+                pbar.set_postfix(loss=f'{metrics["train/kd_total_loss"]:.3f}', cont=f'{metrics["train/avg_cont_len"]:.1f}')
+    else:
+        # ---- ONLINE KD (your original path) ----
+        curriculum = Curriculum(
+            total_kd_steps=cfg_get(cfg, "kd.total_steps", 2000),
+            max_input_len_start=cfg_get(cfg, "kd.curriculum.max_input_len_start", 512),
+            max_input_len_end=cfg_get(cfg, "kd.curriculum.max_input_len_end", 2048),
+            max_new_tokens_start=cfg_get(cfg, "kd.curriculum.max_new_tokens_start", 128),
+            max_new_tokens_end=cfg_get(cfg, "kd.curriculum.max_new_tokens_end", 512),
+            hold_ratio=cfg_get(cfg, "kd.curriculum.hold_ratio", 0.25),
+        )
+        prompts_all = build_prompts_list(tokenizer, cfg, split_override="train")
+        if len(prompts_all) == 0:
+            raise RuntimeError("No prompts found for training.")
+        pbar = tqdm(range(kd_steps), desc="KD/SFT", dynamic_ncols=True)
+        for step in pbar:
+            max_input_len, max_new_tokens = curriculum.at(step)
+            start = (step * kd_batch) % len(prompts_all)
+            end = start + kd_batch
+            batch_prompts = prompts_all[start:end] if end <= len(prompts_all) else (prompts_all[start:] + prompts_all[:(end % len(prompts_all))])
+            metrics = kd_step(
+                tokenizer=tokenizer,
+                draft=draft,
+                target=target,
+                optimizer=optim,
+                prompts=batch_prompts,
+                device=device,
+                kd_cfg=kd_cfg,
+                kd_weights=kd_weights,
+                max_input_len=max_input_len,
+                max_new_tokens=max_new_tokens,
+            )
+            scheduler.step()
+            if step % kd_log_every == 0:
+                wandb.log({**metrics, "train/curr_max_in": max_input_len, "train/curr_max_new": max_new_tokens,
+                        "train/lr": scheduler.get_last_lr()[0]}, step=step)
+                pbar.set_postfix(loss=f'{metrics["train/kd_total_loss"]:.3f}', cont=f'{metrics["train/avg_cont_len"]:.1f}')
+
 
     # save after KD
     outdir = cfg_get(cfg, "training.output_dir", "./outputs")
