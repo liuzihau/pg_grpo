@@ -128,6 +128,16 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
+    def _collate(batch):
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+        # IMPORTANT: keep collate on CPU
+        return collate_topk(
+            batch,
+            pad_id=pad_id,
+            device="cpu",              # <-- was your CUDA device
+            draft_dtype=torch.float32  # keep CPU-friendly dtype in workers
+        )
+
 
     # draft model (Unsloth optional; fallback to PEFT)
     try:
@@ -187,6 +197,21 @@ def main():
     dl = DataLoader(ds, batch_size=int(cfg.kd.batch_size), shuffle=True,
                     num_workers=2, pin_memory=True, collate_fn=_collate)
 
+
+    num_workers = int(cfg_get(cfg, "kd.num_workers", 4))
+    dl = torch.utils.data.DataLoader(
+        ds,
+        batch_size=int(cfg_get(cfg, "kd.batch_size", 4)),
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,            # enables non_blocking H2D copies
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
+        collate_fn=_collate,
+        drop_last=True,
+    )
+
+
     optim = build_optimizer(model, cfg)
     sched = make_sched(optim, int(cfg.kd.total_steps), cfg.kd.get("warmup_ratio", 0.05))
 
@@ -199,6 +224,13 @@ def main():
         try: batch = next(it)
         except StopIteration:
             it = iter(dl); batch = next(it)
+
+        # Move to GPU in the main process only
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                # non_blocking needs pin_memory=True in DataLoader to be effective
+                batch[k] = v.to(device, non_blocking=True)
+
 
         out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False)
         logits = out.logits  # [B,L,V]
