@@ -63,6 +63,56 @@ def parse_torch_dtype(name: str):
 def set_seed(seed: int):
     random.seed(seed); torch.manual_seed(seed)
 
+
+def first_nonempty(*vals):
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+def resolve_model_names(cfg, args=None):
+    # Prefer CLI overrides if provided
+    draft_cli    = getattr(args, "draft_name", None) if args else None
+    teacher_cli  = getattr(args, "teacher_name", None) if args else None
+    tok_cli      = getattr(args, "tokenizer_name", None) if args else None
+
+    draft_name = first_nonempty(
+        draft_cli,
+        cfg_get(cfg, "models.draft"),
+        cfg_get(cfg, "draft.name"),
+        cfg_get(cfg, "model_draft.name"),
+        cfg_get(cfg, "models.tokenizer"),   # last-resort fallback
+    )
+    teacher_name = first_nonempty(
+        teacher_cli,
+        cfg_get(cfg, "models.target"),
+        cfg_get(cfg, "target.name"),
+        cfg_get(cfg, "model_target.name"),
+    )
+    tok_name = first_nonempty(
+        tok_cli,
+        cfg_get(cfg, "models.tokenizer"),
+        cfg_get(cfg, "tokenizer.name"),
+        cfg_get(cfg, "draft.name"),
+        cfg_get(cfg, "models.draft"),
+        teacher_name,  # absolute last fallback
+    )
+
+    missing = []
+    if not draft_name:   missing.append("draft")
+    if not teacher_name: missing.append("teacher")
+    if not tok_name:     missing.append("tokenizer")
+    if missing:
+        raise RuntimeError(
+            "Missing model names in config ({}). Checked multiple paths.\n"
+            "You can also pass --draft_name / --teacher_name / --tokenizer_name.\n"
+            "Loaded config snippets:\n"
+            f"  models: {dict(cfg.get('models', {})) if isinstance(cfg.get('models', {}), dict) else cfg.get('models', {})}\n"
+            f"  draft:  {dict(cfg.get('draft', {}))  if isinstance(cfg.get('draft', {}),  dict) else cfg.get('draft', {})}\n"
+            f"  target: {dict(cfg.get('target', {})) if isinstance(cfg.get('target', {}), dict) else cfg.get('target', {})}\n"
+        )
+    return tok_name, draft_name, teacher_name
+
 # -----------------------------
 # data: prompts from HF chat set
 # -----------------------------
@@ -324,6 +374,10 @@ def main():
     ap.add_argument("--wandb_run_name", type=str, default=None)
     ap.add_argument("--out_dir", type=str, default=None, help="Local output dir for JSON/CSV")
 
+    ap.add_argument("--draft_name", type=str, default=None, help="Override draft model id")
+    ap.add_argument("--teacher_name", type=str, default=None, help="Override teacher model id")
+    ap.add_argument("--tokenizer_name", type=str, default=None, help="Override tokenizer id")
+
     args = ap.parse_args()
 
     raw = load_yaml_with_includes(args.config)
@@ -332,9 +386,9 @@ def main():
 
     device = torch.device(cfg_get(cfg, "training.device", "cuda") if torch.cuda.is_available() else "cpu")
     dtype  = parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16"))
-    tok_name     = cfg_get(cfg, "models.tokenizer", cfg_get(cfg, "models.draft"))
-    teacher_name = cfg_get(cfg, "models.target")
-    draft_name   = cfg_get(cfg, "models.draft")
+    tok_name, draft_name, teacher_name = resolve_model_names(cfg, args)
+    
+    print(f"[eval_specdec] tokenizer={tok_name} | draft={draft_name} | teacher={teacher_name}")
 
     # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
