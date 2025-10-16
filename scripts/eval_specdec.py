@@ -436,6 +436,7 @@ def main():
     })
 
     # wandb
+    print("Start initializing wandb...")
     w_project = args.wandb_project or cfg_get(cfg, "logging.project", "specdec-eval")
     w_runname = args.wandb_run_name or f"spec_eval_K{K}_N{len(prompts)}_{timestamp}"
     wb = maybe_wandb_init(args.wandb, args.wandb_api_key, w_project, w_runname, {
@@ -443,6 +444,7 @@ def main():
         "draft": draft_name, "teacher": teacher_name, "lora_path": args.lora_path,
         "split": args.split
     })
+    print("wandb ok")
 
     headers = ["model_tag", "alpha_accept", "goodput_tokens_per_teacher_call",
                "avg_accepted_span", "reject_rate", "mean_accepted_tokens", "mean_teacher_calls"]
@@ -505,6 +507,7 @@ def main():
         return summary
 
     # Run base + LoRA (if provided)
+    
     _ = run_model(draft_base, "BASE_DRAFT")
     if args.lora_path:
         _ = run_model(draft_lora, "LORA_DRAFT")
