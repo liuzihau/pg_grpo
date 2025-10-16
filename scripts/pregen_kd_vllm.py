@@ -1,29 +1,17 @@
+# scripts/pregen_kd_vllm.py
 from __future__ import annotations
 import os, json, argparse, random
-from typing import List, Dict, Any
+from typing import List
 
 import torch
 from tqdm import tqdm
-
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
-# ---- utils
-def load_yaml(path: str):
-    import yaml
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+# >>> use project utils that support `include:` <<<
+from utils import load_yaml, to_attrdict, set_seed
 
-def to_attrdict(d):
-    class A(dict):
-        __getattr__ = dict.get
-        __setattr__ = dict.__setitem__
-    return A(d)
-
-def set_seed(seed: int):
-    random.seed(seed)
-    torch.manual_seed(seed)
 
 def hf_prompts(tokenizer, cfg, split: str) -> List[str]:
     name = cfg.data.hf_name
@@ -56,9 +44,7 @@ def hf_prompts(tokenizer, cfg, split: str) -> List[str]:
                 try:
                     prompt = tokenizer.apply_chat_template(kept, tokenize=False, add_generation_prompt=True)
                 except Exception:
-                    parts = []
-                    for m in kept:
-                        parts.append(f"{m['role'].capitalize()}: {m['content']}")
+                    parts = [f"{m['role'].capitalize()}: {m['content']}" for m in kept]
                     parts.append("Assistant:")
                     prompt = "\n".join(parts)
                 items.append(prompt)
@@ -67,13 +53,25 @@ def hf_prompts(tokenizer, cfg, split: str) -> List[str]:
             continue
     return []
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
-    cfg = to_attrdict(load_yaml(args.config))
-    kdpg = cfg.kd_pregen
 
+    # Load config with include support
+    cfg = to_attrdict(load_yaml(args.config))
+
+    # --- sanity check ---
+    if not hasattr(cfg, "kd_pregen") or cfg.kd_pregen is None:
+        raise RuntimeError(
+            "Config missing `kd_pregen` block. Make sure your defaults.yaml includes configs/kd_pregen.yaml "
+            "and that file defines:\n\n"
+            "kd_pregen:\n"
+            "  out_dir: ...\n  num_samples: ...\n  shard_size: ...\n  S: ...\n  K: ...\n"
+        )
+
+    kdpg = cfg.kd_pregen
     out_dir      = kdpg.out_dir
     num_samples  = int(kdpg.num_samples)
     shard_size   = int(kdpg.shard_size)
@@ -84,6 +82,9 @@ def main():
     temperature  = float(kdpg.get("temperature", 0.0))
     top_p        = float(kdpg.get("top_p", 1.0))
     top_k        = int(kdpg.get("top_k", 0))
+
+    if not out_dir:
+        raise RuntimeError("`kd_pregen.out_dir` must be set in the config.")
 
     set_seed(seed)
     os.makedirs(out_dir, exist_ok=True)
@@ -105,14 +106,14 @@ def main():
 
     prompts = hf_prompts(tokenizer, cfg, split)
     if not prompts:
-        raise RuntimeError("No prompts from HF")
+        raise RuntimeError("No prompts from HF (allenai/tulu-3-sft-mixture). Check `data.*` in configs/data.yaml.")
 
     idxs = random.sample(range(len(prompts)), k=min(len(prompts), num_samples))
 
-    # vLLM sampling params
+    # vLLM sampling params – continuation only; get logprobs for each generated token
     sp = SamplingParams(
         max_tokens=S, temperature=temperature, top_p=top_p, top_k=top_k,
-        n=1, use_beam_search=False, logprobs=K, prompt_logprobs=False  # only need continuation logprobs
+        n=1, use_beam_search=False, logprobs=K, prompt_logprobs=False
     )
 
     manifest = {"S": S, "K": K, "shards": [], "num_samples": len(idxs),
@@ -135,22 +136,17 @@ def main():
             step_topk_ids = []
             step_topk_lps = []
             for step in range(len(token_ids)):
-                top = token_logprobs[step]  # dict or list of candidate logprobs
-                # vLLM returns a dict {token: logprob} or list of CandidateLogprob; normalize to top-K arrays
+                cand = token_logprobs[step]
                 pairs = []
-                if isinstance(top, dict):
-                    for k_, v_ in top.items():
-                        try:
-                            tid = tokenizer.convert_tokens_to_ids(k_)
-                        except Exception:
-                            continue
+                # handle dict or list shapes from vLLM
+                if isinstance(cand, dict):
+                    for tk, lp in cand.items():
+                        tid = tokenizer.convert_tokens_to_ids(tk)
                         if tid is not None and tid >= 0:
-                            pairs.append((tid, float(v_)))
+                            pairs.append((tid, float(lp)))
                 else:
-                    # list of CandidateLogprob
-                    for cand in top:
-                        pairs.append((cand.token_id, float(cand.logprob)))
-                # keep best K
+                    for c in cand:
+                        pairs.append((c.token_id, float(c.logprob)))
                 pairs.sort(key=lambda x: x[1], reverse=True)
                 pairs = pairs[:K]
                 if not pairs:
@@ -167,7 +163,7 @@ def main():
             # pad to S
             pad_id = tokenizer.eos_token_id
             cont_ids = (token_ids + [pad_id]*(S - len(token_ids)))[:S]
-            # pad top-K arrays
+
             import numpy as np
             ids_arr = np.zeros((S, K), dtype="int32")
             lps_arr = np.full((S, K), -1e30, dtype="float32")
