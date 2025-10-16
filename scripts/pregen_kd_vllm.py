@@ -1,7 +1,7 @@
 # scripts/pregen_kd_vllm.py
 from __future__ import annotations
 import os, json, argparse, random
-from typing import List
+from typing import List, Dict, Any
 
 import torch
 from tqdm import tqdm
@@ -9,66 +9,113 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
-# >>> use project utils that support `include:` <<<
-from utils import load_yaml, to_attrdict, set_seed
+# -----------------------------
+# YAML loader with `include:` support
+# -----------------------------
+def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(a.get(k), dict):
+            a[k] = _deep_update(a[k], v)
+        else:
+            a[k] = v
+    return a
 
+def load_yaml_with_includes(path: str) -> Dict[str, Any]:
+    import yaml
+    base_dir = os.path.dirname(os.path.abspath(path))
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+    includes = cfg.pop("include", []) or []
+    merged: Dict[str, Any] = {}
+    for rel in includes:
+        inc_path = rel if os.path.isabs(rel) else os.path.join(base_dir, rel)
+        sub = load_yaml_with_includes(inc_path)
+        _deep_update(merged, sub)
+    _deep_update(merged, cfg)
+    return merged
 
+class Attr(dict):
+    __getattr__ = dict.get
+    __setattr__ = dict.__setitem__
+def to_attrdict(d: Dict[str, Any]) -> Any:
+    a = Attr()
+    for k, v in d.items():
+        if isinstance(v, dict):
+            a[k] = to_attrdict(v)
+        else:
+            a[k] = v
+    return a
+
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+# -----------------------------
+# Prompt extraction (allenai/tulu-3-sft-mixture)
+# -----------------------------
 def hf_prompts(tokenizer, cfg, split: str) -> List[str]:
     name = cfg.data.hf_name
     field = cfg.data.messages_field
     keep_history = bool(cfg.data.keep_history)
     lw = cfg.data.get("load_kwargs", {}) or {}
+    # try desired split, then validation, test, then cfg.data.split
     for sp in [split, "validation", "test", cfg.data.split]:
         try:
             ds = load_dataset(name, split=sp, **lw)
-            items = []
-            for rec in ds:
-                msgs = rec.get(field, rec.get("conversations", rec.get("conversation", [])))
-                if not isinstance(msgs, list):
-                    continue
-                norm = []
-                for m in msgs:
-                    if isinstance(m, dict):
-                        role = str(m.get("role", m.get("from", ""))).lower()
-                        content = m.get("content", m.get("value", ""))
-                        if content:
-                            norm.append({"role": role, "content": content})
-                # keep up to last user
-                last_user = None
-                for i in range(len(norm)-1, -1, -1):
-                    if norm[i]["role"] == "user":
-                        last_user = i; break
-                if last_user is None:
-                    continue
-                kept = norm[:last_user+1] if keep_history else [norm[last_user]]
-                try:
-                    prompt = tokenizer.apply_chat_template(kept, tokenize=False, add_generation_prompt=True)
-                except Exception:
-                    parts = [f"{m['role'].capitalize()}: {m['content']}" for m in kept]
-                    parts.append("Assistant:")
-                    prompt = "\n".join(parts)
-                items.append(prompt)
-            if items: return items
         except Exception:
             continue
+        items = []
+        for rec in ds:
+            msgs = rec.get(field, rec.get("conversations", rec.get("conversation", [])))
+            if not isinstance(msgs, list):
+                continue
+            norm = []
+            for m in msgs:
+                if isinstance(m, dict):
+                    role = str(m.get("role", m.get("from", ""))).lower()
+                    content = m.get("content", m.get("value", ""))
+                    if content:
+                        norm.append({"role": role, "content": content})
+            # keep up to and including the last user turn
+            last_user = None
+            for i in range(len(norm) - 1, -1, -1):
+                if norm[i]["role"] == "user":
+                    last_user = i
+                    break
+            if last_user is None:
+                continue
+            kept = norm[: last_user + 1] if keep_history else [norm[last_user]]
+            try:
+                prompt = tokenizer.apply_chat_template(
+                    kept, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                parts = [f"{m['role'].capitalize()}: {m['content']}" for m in kept]
+                parts.append("Assistant:")
+                prompt = "\n".join(parts)
+            items.append(prompt)
+        if items:
+            return items
     return []
 
-
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
 
     # Load config with include support
-    cfg = to_attrdict(load_yaml(args.config))
+    raw = load_yaml_with_includes(args.config)
+    cfg = to_attrdict(raw)
 
-    # --- sanity check ---
+    # Sanity: kd_pregen must exist
     if not hasattr(cfg, "kd_pregen") or cfg.kd_pregen is None:
         raise RuntimeError(
-            "Config missing `kd_pregen` block. Make sure your defaults.yaml includes configs/kd_pregen.yaml "
-            "and that file defines:\n\n"
-            "kd_pregen:\n"
-            "  out_dir: ...\n  num_samples: ...\n  shard_size: ...\n  S: ...\n  K: ...\n"
+            "Config missing `kd_pregen` block. Ensure defaults.yaml includes configs/kd_pregen.yaml "
+            "and that file defines:\n"
+            "kd_pregen:\n  out_dir: ...\n  num_samples: ...\n  shard_size: ...\n  S: ...\n  K: ..."
         )
 
     kdpg = cfg.kd_pregen
@@ -89,7 +136,7 @@ def main():
     set_seed(seed)
     os.makedirs(out_dir, exist_ok=True)
 
-    # tokenizer
+    # Tokenizer
     tok_name = cfg.models.get("tokenizer", cfg.models.target)
     tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
     if tokenizer.pad_token_id is None:
@@ -104,25 +151,41 @@ def main():
         gpu_memory_utilization=float(cfg.vllm.gpu_memory_utilization),
     )
 
+    # Prompts
     prompts = hf_prompts(tokenizer, cfg, split)
     if not prompts:
         raise RuntimeError("No prompts from HF (allenai/tulu-3-sft-mixture). Check `data.*` in configs/data.yaml.")
 
     idxs = random.sample(range(len(prompts)), k=min(len(prompts), num_samples))
 
-    # vLLM sampling params – continuation only; get logprobs for each generated token
+    # vLLM sampling params (continuation logprobs only)
     sp = SamplingParams(
-        max_tokens=S, temperature=temperature, top_p=top_p, top_k=top_k,
-        n=1, use_beam_search=False, logprobs=K, prompt_logprobs=False
+        max_tokens=S,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        n=1,
+        use_beam_search=False,
+        logprobs=K,
+        prompt_logprobs=False,
     )
 
-    manifest = {"S": S, "K": K, "shards": [], "num_samples": len(idxs),
-                "temperature": temperature, "top_p": top_p, "top_k": top_k, "seed": seed}
-    buf = []; shard = 0
+    manifest = {
+        "S": S,
+        "K": K,
+        "shards": [],
+        "num_samples": len(idxs),
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "seed": seed,
+    }
+    buf = []
+    shard = 0
 
     pbar = tqdm(range(0, len(idxs), 32), desc="vLLM KD pregen", ncols=100)
     for off in pbar:
-        batch_idx = idxs[off: off+32]
+        batch_idx = idxs[off : off + 32]
         batch_prompts = [prompts[i] for i in batch_idx]
         outs = llm.generate(batch_prompts, sp)
 
@@ -130,7 +193,7 @@ def main():
             prompt_text = out.prompt
             gen = out.outputs[0]
             token_ids = gen.token_ids               # [S'] (<= S)
-            token_logprobs = gen.logprobs           # List[List[TokenLogprob]] length S'
+            token_logprobs = gen.logprobs           # list length S'
 
             # Build top-K arrays per step
             step_topk_ids = []
@@ -138,7 +201,6 @@ def main():
             for step in range(len(token_ids)):
                 cand = token_logprobs[step]
                 pairs = []
-                # handle dict or list shapes from vLLM
                 if isinstance(cand, dict):
                     for tk, lp in cand.items():
                         tid = tokenizer.convert_tokens_to_ids(tk)
@@ -162,7 +224,7 @@ def main():
 
             # pad to S
             pad_id = tokenizer.eos_token_id
-            cont_ids = (token_ids + [pad_id]*(S - len(token_ids)))[:S]
+            cont_ids = (token_ids + [pad_id] * (S - len(token_ids)))[:S]
 
             import numpy as np
             ids_arr = np.zeros((S, K), dtype="int32")
@@ -188,7 +250,8 @@ def main():
                 path = os.path.join(out_dir, f"shard_{shard:05d}.pt")
                 torch.save(buf, path)
                 manifest["shards"].append({"path": os.path.basename(path), "size": len(buf)})
-                buf = []; shard += 1
+                buf = []
+                shard += 1
 
     if buf:
         path = os.path.join(out_dir, f"shard_{shard:05d}.pt")
