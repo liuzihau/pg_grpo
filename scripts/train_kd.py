@@ -128,14 +128,14 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
+
     def _collate(batch):
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-        # IMPORTANT: keep collate on CPU
+        # CPU only collate; no .to("cuda") here
         return collate_topk(
             batch,
             pad_id=pad_id,
-            device="cpu",              # <-- was your CUDA device
-            draft_dtype=torch.float32  # keep CPU-friendly dtype in workers
+            draft_dtype=torch.float32,   # keep workers on CPU-friendly dtype
         )
 
 
@@ -162,7 +162,7 @@ def main():
     except Exception:
         model = AutoModelForCausalLM.from_pretrained(
             cfg.draft.name,
-            torch_dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")),
+            dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")),
             device_map="auto",
         )
         peft = LoraConfig(
@@ -189,14 +189,6 @@ def main():
 
     # data
     ds = PreGeneratedTopKDataset(cfg_get(cfg, "kd.pregen_dir", "data/kd_corpus/qwen8b_S64_topk64"))
-    pad_id = tokenizer.pad_token_id
-
-    def _collate(batch):
-        return collate_topk(batch, pad_id=pad_id, device=device, draft_dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")))
-
-    dl = DataLoader(ds, batch_size=int(cfg.kd.batch_size), shuffle=True,
-                    num_workers=2, pin_memory=True, collate_fn=_collate)
-
 
     num_workers = int(cfg_get(cfg, "kd.num_workers", 4))
     dl = torch.utils.data.DataLoader(
@@ -204,7 +196,7 @@ def main():
         batch_size=int(cfg_get(cfg, "kd.batch_size", 4)),
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,            # enables non_blocking H2D copies
+        pin_memory=True,                       # enables non_blocking H2D copies
         persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,
         collate_fn=_collate,
@@ -221,14 +213,13 @@ def main():
     pbar = tqdm(range(total_steps), desc="KD (top-K)", ncols=100)
     it = iter(dl)
     for step in pbar:
-        try: batch = next(it)
+        try:
+            batch = next(it)
         except StopIteration:
             it = iter(dl); batch = next(it)
 
-        # Move to GPU in the main process only
         for k, v in list(batch.items()):
             if torch.is_tensor(v):
-                # non_blocking needs pin_memory=True in DataLoader to be effective
                 batch[k] = v.to(device, non_blocking=True)
 
 
@@ -290,4 +281,10 @@ def main():
     wandb.finish()
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    try:
+        if mp.get_start_method(allow_none=True) != "spawn":
+            mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     main()

@@ -46,31 +46,40 @@ def left_pad(ids_list: List[torch.Tensor], pad_id: int) -> Tuple[torch.Tensor, t
         mask[i, -l:] = 1
     return out, mask
 
-def collate_topk(batch: List[Dict[str,Any]], pad_id: int, device, draft_dtype):
-    prompts = [torch.tensor(b["prompt_ids"], dtype=torch.long) for b in batch]
-    cont_ids = [torch.tensor(b["cont_ids"], dtype=torch.long) for b in batch]
-    cont_len = torch.tensor([int(b["cont_len"]) for b in batch], dtype=torch.long)
-    # input_ids = prompt || cont[:cont_len-1], predict cont tokens
-    seqs = []
-    for p, c, Lc in zip(prompts, cont_ids, cont_len):
-        seqs.append(torch.cat([p, c[:max(int(Lc-1), 0)]], dim=0))
-    input_ids, attn_mask = left_pad(seqs, pad_id=pad_id)
-    B, L = input_ids.shape
-    S = int(max(int(b["cont_len"]) for b in batch))
-    K = int(batch[0]["topk_ids"].shape[1]) if S>0 else 0
+def collate_topk(batch, pad_id: int, draft_dtype: torch.dtype = torch.float32):
+    B = len(batch)
+    S = max(int(b["cont_len"]) for b in batch)
+    K = int(batch[0]["topk_ids"].shape[1])
 
-    topk_ids = torch.stack([b["topk_ids"] for b in batch], dim=0)[:, :S, :]       # [B,S,K]
-    topk_lps = torch.stack([b["topk_logprobs"] for b in batch], dim=0)[:, :S, :]  # [B,S,K]
-    cont_mask = torch.zeros((B,S), dtype=torch.float32)
-    for i, Lc in enumerate(cont_len):
-        cont_mask[i, :int(Lc)] = 1.0
+    max_prompt = max(len(b["prompt_ids"]) for b in batch)
+
+    input_ids      = torch.full((B, max_prompt + S), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros_like(input_ids)
+    cont_mask      = torch.zeros((B, S), dtype=torch.float32)
+    topk_ids       = torch.zeros((B, S, K), dtype=torch.long)
+    topk_logprobs  = torch.full((B, S, K), -1e30, dtype=torch.float32)
+    cont_len       = torch.zeros((B,), dtype=torch.long)
+
+    for i, b in enumerate(batch):
+        pids = torch.tensor(b["prompt_ids"], dtype=torch.long)
+        Lp = pids.numel()
+        input_ids[i, :Lp] = pids
+        attention_mask[i, :Lp] = 1
+
+        Si = min(S, int(b["cont_len"]))
+        cont_len[i] = Si
+        cont_mask[i, :Si] = 1
+
+        ids = b["topk_ids"][:Si].to(torch.long)
+        lps = b["topk_logprobs"][:Si].to(torch.float32)
+        topk_ids[i, :Si] = ids
+        topk_logprobs[i, :Si] = lps
 
     return {
-        "input_ids": input_ids.to(device),
-        "attention_mask": attn_mask.to(device),
-        "cont_ids": torch.stack([c for c in cont_ids], 0)[:, :S].to(device),
-        "cont_len": cont_len.to(device),
-        "cont_mask": cont_mask.to(device),
-        "topk_ids": topk_ids.to(device),
-        "topk_logprobs": topk_lps.to(device),
+        "input_ids": input_ids,              # CPU tensors
+        "attention_mask": attention_mask,
+        "cont_mask": cont_mask,
+        "topk_ids": topk_ids,
+        "topk_logprobs": topk_logprobs,
+        "cont_len": cont_len,
     }
