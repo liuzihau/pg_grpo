@@ -1,17 +1,17 @@
 from __future__ import annotations
 # --- Unsloth optional import (must come BEFORE transformers/peft if used) ---
-USE_UNSLOTH = True
-try:
-    import os as _os
-    if _os.environ.get("USE_UNSLOTH", "1") in ("0", "false", "False"):
-        USE_UNSLOTH = False
-    if USE_UNSLOTH:
-        import unsloth  # if this raises, we'll fall back
-        from unsloth import FastLanguageModel  # optional; not required if you load with HF
-        print("🦥 Unsloth enabled.")
-except Exception as _e:
-    print(f"[warn] Unsloth disabled (import failed): {repr(_e)}")
+import os
+if os.environ.get("USE_UNSLOTH", "0") in ("0","false","False"):
     USE_UNSLOTH = False
+else:
+    USE_UNSLOTH = True
+    try:
+        import unsloth
+        from unsloth import FastLanguageModel
+        print("🦥 Unsloth enabled.")
+    except Exception as e:
+        print(f"[warn] Unsloth disabled: {e!r}")
+        USE_UNSLOTH = False
 
 import os, argparse, math,yaml
 from functools import partial
@@ -175,6 +175,20 @@ def main():
         )
         model = get_peft_model(model, peft)
 
+    if hasattr(model, "get_output_embeddings") and model.get_output_embeddings() is not None:
+        for p in model.get_output_embeddings().parameters():
+            p.requires_grad_(True)
+
+    # for checkpointing + frozen base, make inputs require grad
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        # Fallback hook if the method doesn't exist
+        def _require_grads_hook(module, inputs, output):
+            if isinstance(output, torch.Tensor):
+                output.requires_grad_(True)
+        model.get_input_embeddings().register_forward_hook(_require_grads_hook)
+
     # memory knobs
     if hasattr(model, "gradient_checkpointing_enable"):
         try:
@@ -186,6 +200,7 @@ def main():
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
     model.train()
+
 
     # data
     ds = PreGeneratedTopKDataset(cfg_get(cfg, "kd.pregen_dir", "data/kd_corpus/qwen8b_S64_topk64"))
@@ -251,12 +266,12 @@ def main():
             weights = (margin_w * (1.0 + cfg.kd.get("mismatch_lambda", 0.3) * mismatch)) * batch["cont_mask"]
 
         loss = sparse_kd_kl(
-            d_logits_BT_V=d_logits_BT_V,
-            topk_ids_BTK=batch["topk_ids"],
-            topk_logprobs_BTK=batch["topk_logprobs"],
-            mask_BT=weights,  # incorporate weights in mask (scaled later)
-            tail_mode=str(cfg.kd.get("topk_tail", "bucket")),
+            d_logits_BT_V=d_logits_BT_V,              # [B,S,V] from model forward
+            topk_ids_BTK=batch["topk_ids"],           # [B,S,K]
+            topk_logprobs_BTK=batch["topk_logprobs"], # [B,S,K]
+            mask_BT=weights,                          # [B,S]
             distill_temp=float(cfg.kd.get("distill_temp", 1.0)),
+            tail_mode=str(cfg.kd.get("topk_tail", "renorm")),
         )
 
         optim.zero_grad(set_to_none=True)
