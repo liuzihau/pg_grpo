@@ -1,0 +1,22 @@
+grpo:
+  total_steps: 30000            # trainer.num_train_epochs or max_steps as you prefer
+  batch_size: 2
+  grad_accum: 1
+  group_size: 4
+  S: 2
+  teacher_temperature: 0.0
+  teacher_top_p: 1.0
+  teacher_top_k: 0
+  save_every: 2000
+
+reward:
+  divergence: kl
+  alpha: 0.5
+  topk_for_ce: 64
+  tail_mode: bucket         # or "ignore"
+  distill_temp: 1.0
+  include_first_reject: true
+  entropy_bonus: 0.003
+  anchor_kl_beta: 0.03
+  clip_reward: true
+  clip_range: [-20.0, 0.0]

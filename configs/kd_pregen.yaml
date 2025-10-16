@@ -1,0 +1,12 @@
+kd_pregen:
+  out_dir: data/kd_corpus/qwen8b_S64_topk64
+  num_samples: 10000
+  shard_size: 2000
+  S: 64
+  K: 64
+  split: train
+  seed: 1234
+  # generation settings (teacher)
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0

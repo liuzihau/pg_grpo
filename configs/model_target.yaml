@@ -1,0 +1,8 @@
+models:
+  tokenizer: Qwen/Qwen3-0.6B
+  target:    Qwen/Qwen3-8B
+
+vllm:
+  tensor_parallel_size: 1
+  dtype: "bfloat16"
+  gpu_memory_utilization: 0.92

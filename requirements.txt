@@ -1,6 +1,11 @@
 accelerate
 peft
-transformers>=4.55.0
+transformers==4.57.0
 torch>=2.5.1
 datasets
+safetensors
+bitsandbytes
+vllm
+trl
+unsloth
 wandb

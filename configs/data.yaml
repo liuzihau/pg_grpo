@@ -1,0 +1,9 @@
+data:
+  source: hf
+  hf_name: allenai/tulu-3-sft-mixture
+  split: train
+  messages_field: messages
+  keep_history: true
+  sample_max: 50000
+  load_kwargs: {}
+  max_input_len: 1024

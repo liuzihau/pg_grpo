@@ -1,0 +1,8 @@
+include:
+  - configs/data.yaml
+  - configs/model_draft.yaml
+  - configs/model_target.yaml
+  - configs/kd_pregen.yaml
+  - configs/kd_train.yaml
+  - configs/grpo_train.yaml
+  - configs/logging.yaml
