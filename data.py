@@ -1,3 +1,4 @@
+# data.py
 from __future__ import annotations
 import json
 from typing import List, Dict, Optional, Any
@@ -18,9 +19,10 @@ class PromptOnlyDataset:
     def __getitem__(self, i: int) -> Dict[str, str]: return self.items[i]
 
 def _to_user_terminal_history(msgs: List[Dict[str, str]], keep_history: bool = True) -> Optional[List[Dict[str, str]]]:
+    # keep up to the last 'user' turn
     last_user = None
     for i in reversed(range(len(msgs))):
-        if msgs[i].get("role") == "user":
+        if str(msgs[i].get("role", "")).lower() == "user":
             last_user = i
             break
     if last_user is None:
@@ -34,14 +36,12 @@ def _render_prompt(tokenizer, msgs_u: List[Dict[str, str]]) -> str:
     try:
         return tokenizer.apply_chat_template(msgs_u, tokenize=False, add_generation_prompt=True)
     except Exception:
+        # very safe fallback
         parts = []
         for m in msgs_u:
             role = m.get("role", "user")
             content = m.get("content", "")
-            if role == "user":
-                parts.append(f"User: {content}")
-            else:
-                parts.append(f"Assistant: {content}")
+            parts.append(f"{role.capitalize()}: {content}")
         parts.append("Assistant:")
         return "\n".join(parts)
 
@@ -57,16 +57,32 @@ class HFChatPromptsDataset:
         load_kwargs: Optional[Dict[str, Any]] = None,
     ):
         from datasets import load_dataset
-        if not isinstance(dataset_name, str):
-            raise ValueError(f"dataset_name must be a string repo id, got {type(dataset_name)}: {dataset_name!r}")
-        ds = load_dataset(dataset_name, split=split, **(load_kwargs or {}))
+        lw = dict(load_kwargs or {})
+        # give users a way to pass token/cache/streaming via cfg
+        ds = load_dataset(dataset_name, split=split, **lw)
 
+        # accept multiple common field names
+        candidate_fields = [messages_field, "messages", "conversations", "conversation", "turns"]
         self.items: List[Dict[str, str]] = []
         for rec in ds:
-            msgs = rec.get(messages_field)
+            msgs = None
+            for field in candidate_fields:
+                if field in rec and isinstance(rec[field], list):
+                    msgs = rec[field]
+                    break
             if not isinstance(msgs, list):
                 continue
-            msgs_u = _to_user_terminal_history(msgs, keep_history=keep_history)
+            # normalize to {role, content}
+            norm = []
+            for m in msgs:
+                if isinstance(m, dict):
+                    role = str(m.get("role", m.get("from", ""))).lower()
+                    # some datasets call text 'value' or 'content'
+                    content = m.get("content", m.get("value", ""))
+                    if not content:
+                        continue
+                    norm.append({"role": role, "content": content})
+            msgs_u = _to_user_terminal_history(norm, keep_history=keep_history)
             if not msgs_u:
                 continue
             prompt_txt = _render_prompt(tokenizer, msgs_u)

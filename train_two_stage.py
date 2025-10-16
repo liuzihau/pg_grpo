@@ -75,14 +75,16 @@ def _move_if_needed(m, device):
 # ----------------------------
 # data
 # ----------------------------
+# train_two_stage.py
 def build_prompts_list(tokenizer, cfg, split_override: str | None = None) -> List[str]:
     """
     Build prompts from HF (preferred) or local file.
-    split_override: 'train' | 'validation' | 'test' or None (use cfg.data.split)
+    If HF fails/empty, fall back to local JSONL.
     """
     data_cfg = getattr(cfg, "data", {}) or {}
-    source = getattr(data_cfg, "source", None) or data_cfg.get("source")
+    source = (getattr(data_cfg, "source", None) or data_cfg.get("source") or "hf").lower()
     split = split_override or getattr(data_cfg, "split", "train")
+    errors: List[str] = []
 
     if source == "hf":
         name  = getattr(data_cfg, "hf_name", None) or data_cfg.get("hf_name")
@@ -91,12 +93,17 @@ def build_prompts_list(tokenizer, cfg, split_override: str | None = None) -> Lis
         field = getattr(data_cfg, "messages_field", "messages")
         keep_history = getattr(data_cfg, "keep_history", True)
         sample_max = getattr(data_cfg, "sample_max", None)
-        load_kwargs = getattr(data_cfg, "load_kwargs", None) or {}
+        load_kwargs = dict(getattr(data_cfg, "load_kwargs", None) or {})
 
-        # If requested split fails, try fallbacks
+        # let users pass token/cache/streaming via config:
+        # data:
+        #   load_kwargs:
+        #     token: ${HF_TOKEN}
+        #     streaming: false
+        #     cache_dir: /some/cache
         tried = []
         for sp in [split, "validation", "test", getattr(data_cfg, "split", "train")]:
-            if sp in tried: 
+            if sp in tried:
                 continue
             tried.append(sp)
             try:
@@ -112,18 +119,44 @@ def build_prompts_list(tokenizer, cfg, split_override: str | None = None) -> Lis
                 items = [rec["prompt"] for rec in ds]
                 if len(items) > 0:
                     return items
-            except Exception:
-                continue
-        # fall back to empty -> handled by caller
-        return []
+                else:
+                    errors.append(f"HF dataset loaded but 0 prompts after parsing (split={sp}).")
+            except Exception as e:
+                errors.append(f"HF load failed for split={sp}: {type(e).__name__}: {e}")
 
-    # Local jsonl paths
+        # HF failed or empty: try local file if provided
+        local_eval_path = cfg_get(cfg, "eval.prompts_path", None)
+        local_train_path = cfg_get(cfg, "data.prompts_path", None)
+        for path in [local_train_path, local_eval_path]:
+            if path and os.path.exists(path):
+                ds = PromptOnlyDataset(path)
+                items = [rec["prompt"] for rec in ds]
+                if len(items) > 0:
+                    print(f"[data] Falling back to local prompts at {path} (n={len(items)})")
+                    return items
+
+        # Still nothing -> raise with actionable message
+        hint = (
+            "No prompts found. Possible fixes:\n"
+            "  • Check internet/HF credentials (set `data.load_kwargs.token` or `HF_TOKEN`).\n"
+            "  • Verify dataset and split exist (data.hf_name, data.split).\n"
+            "  • Provide a local JSONL via `data.prompts_path` (one object per line: {\"prompt\": \"...\"}).\n"
+            "  • Or set `data.source: local` and `data.prompts_path: path/to/prompts.jsonl`.\n"
+            f"Details:\n- " + "\n- ".join(errors)
+        )
+        raise RuntimeError(hint)
+
+    # Local JSONL paths
     path = cfg_get(cfg, "data.prompts_path", "data/prompts.jsonl")
     if split_override in ("validation", "test"):
         path = cfg_get(cfg, "eval.prompts_path", None) or cfg_get(cfg, "data.val_prompts_path", path)
+    if not os.path.exists(path):
+        raise RuntimeError(f"Local prompts file not found: {path}")
     ds = PromptOnlyDataset(path)
-    return [rec["prompt"] for rec in ds]
-
+    items = [rec["prompt"] for rec in ds]
+    if not items:
+        raise RuntimeError(f"Local prompts file is empty: {path}")
+    return items
 
 # ----------------------------
 # rollout for GRPO collection
