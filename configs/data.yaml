@@ -7,3 +7,4 @@ data:
   sample_max: 50000
   load_kwargs: {}
   max_input_len: 1024
+  max_input_len: 2048

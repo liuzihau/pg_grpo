@@ -203,6 +203,14 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
+    max_in = int(getattr(cfg.kd_pregen, "max_input_len", getattr(cfg.data, "max_input_len", 4096)))
+
+    def _trim_prompt_to_max(s: str) -> str:
+        enc = tokenizer(s, truncation=True, max_length=max_in, return_tensors=None)
+        ids = enc["input_ids"]
+        # re-decode so vLLM receives a short prompt
+        return tokenizer.decode(ids, skip_special_tokens=False)
+
     # Load prompts BEFORE creating the LLM (avoid GPU idle reservation during HF I/O)
     print("[pregen] loading prompts...")
     prompts = hf_prompts(tokenizer, cfg, split)
@@ -271,6 +279,7 @@ def main():
     for off in pbar:
         batch_idx = idxs[off : off + micro_bs]
         batch_prompts = [prompts[i] for i in batch_idx]
+        batch_prompts = [_trim_prompt_to_max(p) for p in batch_prompts]  # <-- trim here
         outs = llm.generate(batch_prompts, sp)
 
         for out in outs:
