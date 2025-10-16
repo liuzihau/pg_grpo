@@ -9,40 +9,67 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
+# -----------------------------
+# Robust normalizers for vLLM 0.11 logprobs outputs
+# -----------------------------
+def _to_token_id(tk, tokenizer) -> int | None:
+    """Normalize token key to an int ID."""
+    if isinstance(tk, int):
+        return tk
+    if isinstance(tk, str):
+        tid = tokenizer.convert_tokens_to_ids(tk)
+        return int(tid) if (tid is not None and tid >= 0) else None
+    # objects: might have .token_id or .id or text fields
+    for attr in ("token_id", "id"):
+        tid = getattr(tk, attr, None)
+        if isinstance(tid, int) and tid >= 0:
+            return tid
+    for attr in ("decoded_token", "token", "text"):
+        tstr = getattr(tk, attr, None)
+        if isinstance(tstr, str):
+            tid = tokenizer.convert_tokens_to_ids(tstr)
+            return int(tid) if (tid is not None and tid >= 0) else None
+    return None
 
-# -----------------------------
-# Helper
-# -----------------------------
+def _to_logprob(lp) -> float | None:
+    """Extract float logprob from vLLM 0.11 Logprob or raw number."""
+    if isinstance(lp, (float, int)):
+        return float(lp)
+    v = getattr(lp, "logprob", None)
+    if isinstance(v, (float, int)):
+        return float(v)
+    if isinstance(lp, dict) and "logprob" in lp:
+        v = lp["logprob"]
+        if isinstance(v, (float, int)):
+            return float(v)
+    return None
+
 def _pairs_from_cand(cand, tokenizer):
     """
-    Normalize a single step's candidate logprobs into a list[(token_id:int, logprob:float)].
-    Supports vLLM 0.11 shapes:
-      - dict: { token(str|int) -> logprob(float) }
-      - list: [TokenLogprob(token_id=int, logprob=float), ...]
+    Normalize one step's candidate logprobs into list[(token_id:int, logprob:float)].
+    Supports:
+      - dict: { token(str|int|Token) -> Logprob }
+      - list: [Logprob(token_id=int, logprob=float), ...]
     """
     pairs = []
     if isinstance(cand, dict):
         for tk, lp in cand.items():
-            # tk may be int (already an ID) or str (a token string)
-            if isinstance(tk, int):
-                tid = tk
-            else:
-                try:
-                    tid = tokenizer.convert_tokens_to_ids(tk)
-                except Exception:
-                    # If something odd slips through, skip it safely
-                    continue
-            if tid is None or tid < 0:
+            tid = _to_token_id(tk, tokenizer)
+            lpf = _to_logprob(lp)
+            if tid is None or lpf is None:
                 continue
-            pairs.append((int(tid), float(lp)))
+            pairs.append((int(tid), float(lpf)))
     else:
-        # Assume iterable of objects with .token_id and .logprob
+        # iterable of Logprob-like objects
         for c in cand:
             tid = getattr(c, "token_id", None)
-            lp  = getattr(c, "logprob", None)
-            if tid is None or lp is None:
+            if tid is None:
+                # fallbacks
+                tid = _to_token_id(c, tokenizer)
+            lpf = _to_logprob(c)
+            if tid is None or lpf is None:
                 continue
-            pairs.append((int(tid), float(lp)))
+            pairs.append((int(tid), float(lpf)))
     return pairs
 
 # -----------------------------
@@ -76,10 +103,7 @@ class Attr(dict):
 def to_attrdict(d: Dict[str, Any]) -> Any:
     a = Attr()
     for k, v in d.items():
-        if isinstance(v, dict):
-            a[k] = to_attrdict(v)
-        else:
-            a[k] = v
+        a[k] = to_attrdict(v) if isinstance(v, dict) else v
     return a
 
 def set_seed(seed: int):
@@ -179,32 +203,55 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
-    # vLLM teacher
-    llm = LLM(
-        model=cfg.models.target,
-        tensor_parallel_size=int(cfg.vllm.tensor_parallel_size),
-        dtype=cfg.vllm.dtype,
-        gpu_memory_utilization=float(cfg.vllm.gpu_memory_utilization),
-    )
-
-    # Prompts
+    # Load prompts BEFORE creating the LLM (avoid GPU idle reservation during HF I/O)
+    print("[pregen] loading prompts...")
     prompts = hf_prompts(tokenizer, cfg, split)
     if not prompts:
         raise RuntimeError("No prompts from HF (allenai/tulu-3-sft-mixture). Check `data.*` in configs/data.yaml.")
-
+    print(f"[pregen] got {len(prompts)} prompts")
     idxs = random.sample(range(len(prompts)), k=min(len(prompts), num_samples))
 
-    # vLLM sampling params (continuation logprobs only)
+    # vLLM teacher (allow K logprobs)
+    print("[pregen] init vLLM…")
+    try:
+        llm = LLM(
+            model=cfg.models.target,
+            tensor_parallel_size=int(cfg.vllm.tensor_parallel_size),
+            dtype=cfg.vllm.dtype,
+            gpu_memory_utilization=float(cfg.vllm.gpu_memory_utilization),
+            max_logprobs=K,  # lift cap over default 20
+        )
+    except TypeError:
+        # fallback if your build doesn't accept max_logprobs here
+        from vllm.engine.arg_utils import EngineArgs
+        eng = EngineArgs(
+            model=cfg.models.target,
+            tensor_parallel_size=int(cfg.vllm.tensor_parallel_size),
+            dtype=cfg.vllm.dtype,
+            gpu_memory_utilization=float(cfg.vllm.gpu_memory_utilization),
+            max_logprobs=K,
+        )
+        llm = LLM(eng)
+    print("[pregen] vLLM ready")
+
+    # vLLM sampling params (continuation logprobs only) — vLLM 0.11 compatible
     sp = SamplingParams(
         max_tokens=S,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         n=1,
-        seed=seed,           # optional but handy for reproducibility
-        logprobs=K,          # top-K logprobs for GENERATED tokens
-        prompt_logprobs=None # don't request prompt logprobs
+        seed=seed,
+        logprobs=K,           # top-K logprobs for GENERATED tokens
+        prompt_logprobs=None  # don't request prompt logprobs
     )
+
+    # Smoke-test one tiny batch to fail fast (optional, but helpful)
+    test_prompts = [prompts[idxs[0]]] if idxs else prompts[:1]
+    if test_prompts:
+        print("[pregen] smoke-test generate(1)…")
+        _ = llm.generate(test_prompts, sp)
+        print("[pregen] smoke-test OK")
 
     manifest = {
         "S": S,
@@ -219,9 +266,10 @@ def main():
     buf = []
     shard = 0
 
-    pbar = tqdm(range(0, len(idxs), 32), desc="vLLM KD pregen", ncols=100)
+    micro_bs = 8  # smaller first if you see stalls; raise when stable
+    pbar = tqdm(range(0, len(idxs), micro_bs), desc="vLLM KD pregen", ncols=100)
     for off in pbar:
-        batch_idx = idxs[off : off + 32]
+        batch_idx = idxs[off : off + micro_bs]
         batch_prompts = [prompts[i] for i in batch_idx]
         outs = llm.generate(batch_prompts, sp)
 
@@ -245,7 +293,6 @@ def main():
                 lps = [p[1] for p in pairs]
                 step_topk_ids.append(ids)
                 step_topk_lps.append(lps)
-
 
             cont_len = len(step_topk_ids)
             if cont_len == 0:
@@ -279,7 +326,7 @@ def main():
                 path = os.path.join(out_dir, f"shard_{shard:05d}.pt")
                 torch.save(buf, path)
                 manifest["shards"].append({"path": os.path.basename(path), "size": len(buf)})
-                buf = []
+                buf.clear()
                 shard += 1
 
     if buf:
