@@ -1,1 +1,3 @@
-python generate_kd_corpus.py --config configs/train.yaml
+#!/bin/bash
+
+python -m scripts.pregen_kd_vllm --config configs/defaults.yaml

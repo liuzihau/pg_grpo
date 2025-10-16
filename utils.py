@@ -50,7 +50,6 @@ def to_attrdict(obj: Any) -> Any:
         return obj
 
 
-import torch
 
 def compute_first_reject_mask(accepted_mask: torch.Tensor) -> torch.Tensor:
     """
