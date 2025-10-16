@@ -44,6 +44,9 @@ def pack_batch(
     )
     input_ids = enc["input_ids"].to(device)
     attn_mask = enc["attention_mask"].to(device)
+    pad = tokenizer.pad_token_id
+    if pad is None:
+        pad = tokenizer.eos_token_id
     gen = target_model.generate(
         input_ids=input_ids,
         attention_mask=attn_mask,
@@ -51,7 +54,7 @@ def pack_batch(
         temperature=max(temperature, 1e-6) if temperature > 0.0 else None,
         max_new_tokens=max_new_tokens,
         use_cache=True,
-        pad_token_id=tokenizer.eos_token_id,
+        pad_token_id=pad,
     )
     B, Ltot = gen.shape
     cont_mask = torch.zeros_like(gen, dtype=torch.float32)

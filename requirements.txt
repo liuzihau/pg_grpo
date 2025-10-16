@@ -2,4 +2,5 @@ accelerate
 peft
 transformers>=4.55.0
 torch>=2.5.1
+datasets
 wandb

@@ -245,6 +245,15 @@ def rollout_one(
 # evaluation routines
 # ----------------------------
 @torch.no_grad()
+def _grab_logits(out) -> torch.Tensor:
+    # Works for ModelOutput or tuple/list
+    if hasattr(out, "logits") and out.logits is not None:
+        return out.logits
+    if isinstance(out, (tuple, list)) and len(out) > 0 and torch.is_tensor(out[0]):
+        return out[0]
+    raise RuntimeError(f"Model forward did not return logits. Got: {type(out)}")
+
+@torch.no_grad()
 def eval_kd_alignment(
     *,
     tokenizer,
@@ -265,37 +274,50 @@ def eval_kd_alignment(
         max_new_tokens=gen_tokens,
         temperature=0.0,
     )
+
+    # Input to forwards: [B, L-1]
     input_ids = full_ids[:, :-1].contiguous()
     attn_mask = nonpad_mask[:, :-1].contiguous()
     cont_region = cont_mask[:, 1:].contiguous()
 
-    t_out = target(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
-    teacher_logits = t_out.logits
-    d_out = draft(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
-    draft_logits = d_out.logits
+    # For safety, ensure non-empty
+    assert input_ids.numel() > 0, "Empty input_ids in eval_kd_alignment."
 
-    # [T,B,*]
-    TNV_t = teacher_logits.transpose(0,1).contiguous()
-    TNV_d = draft_logits.transpose(0,1).contiguous()
-    TN_cont = cont_region.transpose(0,1).contiguous()
-    TN_attn = attn_mask.transpose(0,1).contiguous()
+    target.eval(); draft.eval()
+    t_out = target(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+    d_out = draft(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+
+    teacher_logits = _grab_logits(t_out)
+    draft_logits   = _grab_logits(d_out)
+
+    # Expect [B, L-1, V]
+    if teacher_logits.dim() != 3:
+        raise RuntimeError(f"teacher_logits has dim {teacher_logits.dim()}, expected 3. Shape={tuple(teacher_logits.shape)}")
+    if draft_logits.dim() != 3:
+        raise RuntimeError(f"draft_logits has dim {draft_logits.dim()}, expected 3. Shape={tuple(draft_logits.shape)}")
+
+    # [T,B,*] layout
+    TNV_t = teacher_logits.transpose(0, 1).contiguous()  # [T,B,V]
+    TNV_d = draft_logits.transpose(0, 1).contiguous()    # [T,B,V]
+    TN_cont = cont_region.transpose(0, 1).contiguous()   # [T,B]
+    TN_attn = attn_mask.transpose(0, 1).contiguous()     # [T,B]
     mask_TN = (TN_cont * TN_attn)
 
     # divergences
-    kl_t = compute_token_divergence(TNV_t, TNV_d, kind="kl", alpha=0.5, topk_for_ce=0)   # [T,B]
-    a05_t = compute_token_divergence(TNV_t, TNV_d, kind="alpha", alpha=0.5, topk_for_ce=0)
-    denom = mask_TN.sum().clamp_min(1.0)
+    kl_t   = compute_token_divergence(TNV_t, TNV_d, kind="kl",    alpha=0.5, topk_for_ce=0)  # [T,B]
+    a05_t  = compute_token_divergence(TNV_t, TNV_d, kind="alpha", alpha=0.5, topk_for_ce=0)  # [T,B]
+    denom  = mask_TN.sum().clamp_min(1.0)
 
-    # top-1 match on continuation region
-    t_argmax = teacher_logits.argmax(dim=-1)
-    d_argmax = draft_logits.argmax(dim=-1)
+    # top-1 match on continuation region only
+    t_argmax = teacher_logits.argmax(dim=-1)  # [B,L-1]
+    d_argmax = draft_logits.argmax(dim=-1)    # [B,L-1]
     match = ((t_argmax == d_argmax).float() * cont_region).sum() / cont_region.sum().clamp_min(1.0)
 
     return {
-        "eval/kl_per_tok": float((kl_t * mask_TN).sum().cpu() / denom),
-        "eval/alpha05_per_tok": float((a05_t * mask_TN).sum().cpu() / denom),
-        "eval/top1_match_rate": float(match.cpu()),
-        "eval/avg_cont_len": float(cont_region.sum(dim=1).mean().cpu()),
+        "eval/kl_per_tok":        float((kl_t * mask_TN).sum().cpu() / denom),
+        "eval/alpha05_per_tok":   float((a05_t * mask_TN).sum().cpu() / denom),
+        "eval/top1_match_rate":   float(match.cpu()),
+        "eval/avg_cont_len":      float(cont_region.sum(dim=1).mean().cpu()),
     }
 
 @torch.no_grad()
@@ -309,7 +331,6 @@ def eval_spec_acceptance(
     max_input_len: int,
     T: int,
 ) -> Dict[str, float]:
-    # Use greedy rollout (temperature=0.0)
     out = rollout_one(
         prompts=prompts,
         tokenizer=tokenizer,
@@ -320,14 +341,13 @@ def eval_spec_acceptance(
         spec_window=T,
         max_input_len=max_input_len,
     )
-    acc = out["accepted_mask"]  # [T,N]
-    per_seq_accepts = acc.sum(dim=0)               # [N]
-    full_accept = (per_seq_accepts == T).float()   # [N]
+    acc = out["accepted_mask"]                 # [T,N]
+    per_seq_accepts = acc.sum(dim=0)           # [N]
+    full_accept = (per_seq_accepts == T).float()
     return {
         "eval/accept_tokens_mean": float(per_seq_accepts.mean().cpu()),
-        "eval/full_accept_rate": float(full_accept.mean().cpu()),
+        "eval/full_accept_rate":   float(full_accept.mean().cpu()),
     }
-
 
 # ----------------------------
 # main
@@ -362,6 +382,13 @@ def main():
                          device=cfg_get(cfg, "training.device", "cuda"))
     draft  = load_draft(dft_name, dtype=cfg_get(cfg, "training.dtype", "bf16"),
                         device=cfg_get(cfg, "training.device", "cuda"))
+
+    # Ensure padding is defined and consistent
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    for m in (target, draft):
+        if getattr(m.config, "pad_token_id", None) is None:
+            m.config.pad_token_id = tokenizer.pad_token_id
 
     try:
         for m in (target, draft):
