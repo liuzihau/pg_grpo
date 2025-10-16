@@ -1,3 +1,17 @@
+# --- Unsloth optional import (must come BEFORE transformers/peft if used) ---
+USE_UNSLOTH = True
+try:
+    import os as _os
+    if _os.environ.get("USE_UNSLOTH", "1") in ("0", "false", "False"):
+        USE_UNSLOTH = False
+    if USE_UNSLOTH:
+        import unsloth  # if this raises, we'll fall back
+        from unsloth import FastLanguageModel  # optional; not required if you load with HF
+        print("🦥 Unsloth enabled.")
+except Exception as _e:
+    print(f"[warn] Unsloth disabled (import failed): {repr(_e)}")
+    USE_UNSLOTH = False
+
 from __future__ import annotations
 import os, argparse, math,yaml
 from typing import Any, Dict
@@ -43,24 +57,36 @@ def to_attrdict(d: Dict[str, Any]) -> Any:
         a[k] = to_attrdict(v) if isinstance(v, dict) else v
     return a
 
-def cfg_get(obj, path: str, default=None):
-    cur = obj
-    for key in path.split("."):
-        if isinstance(cur, dict):
-            cur = cur.get(key)
-        else:
-            cur = getattr(cur, key, None)
-        if cur is None:
-            return default
-    return cur
-
 def load_yaml(path):
     import yaml
     with open(path, "r") as f:
         return yaml.safe_load(f)
+    
+def parse_torch_dtype(name: str):
+    n = str(name).lower()
+    if n in ("bf16", "bfloat16", "bfloat"):
+        import torch
+        return torch.bfloat16
+    if n in ("fp16", "float16", "half"):
+        import torch
+        return torch.float16
+    if n in ("fp32", "float32", "float"):
+        import torch
+        return torch.float32
+    if n in ("fp8",):
+        import torch
+        return getattr(torch, "float8_e4m3fn", getattr(torch, "float8_e5m2", torch.float16))
+    import torch
+    return torch.float32
 
+def cfg_get(obj, path, default=None):
+    cur = obj
+    for key in path.split("."):
+        cur = (cur.get(key) if isinstance(cur, dict) else getattr(cur, key, None))
+        if cur is None:
+            return default
+    return cur
 
-def to_attr(d): return Attr(d)
 
 def set_seed(seed: int):
     import random
@@ -126,7 +152,7 @@ def main():
     except Exception:
         model = AutoModelForCausalLM.from_pretrained(
             cfg.draft.name,
-            torch_dtype=getattr(torch, cfg.training.dtype),
+            torch_dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")),
             device_map="auto",
         )
         peft = LoraConfig(
