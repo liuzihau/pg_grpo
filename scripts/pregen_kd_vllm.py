@@ -165,9 +165,9 @@ def main():
         top_p=top_p,
         top_k=top_k,
         n=1,
-        use_beam_search=False,
-        logprobs=K,
-        prompt_logprobs=False,
+        seed=seed,           # optional but handy for reproducibility
+        logprobs=K,          # top-K logprobs for GENERATED tokens
+        prompt_logprobs=None # don't request prompt logprobs
     )
 
     manifest = {
