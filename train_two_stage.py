@@ -386,6 +386,8 @@ def main():
     # Ensure padding is defined and consistent
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
+    
     for m in (target, draft):
         if getattr(m.config, "pad_token_id", None) is None:
             m.config.pad_token_id = tokenizer.pad_token_id
