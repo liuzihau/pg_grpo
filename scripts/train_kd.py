@@ -1,3 +1,4 @@
+from __future__ import annotations
 # --- Unsloth optional import (must come BEFORE transformers/peft if used) ---
 USE_UNSLOTH = True
 try:
@@ -12,7 +13,6 @@ except Exception as _e:
     print(f"[warn] Unsloth disabled (import failed): {repr(_e)}")
     USE_UNSLOTH = False
 
-from __future__ import annotations
 import os, argparse, math,yaml
 from typing import Any, Dict
 import torch, torch.nn as nn
@@ -182,7 +182,7 @@ def main():
     pad_id = tokenizer.pad_token_id
 
     def _collate(batch):
-        return collate_topk(batch, pad_id=pad_id, device=device, draft_dtype=getattr(torch, cfg.training.dtype))
+        return collate_topk(batch, pad_id=pad_id, device=device, draft_dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")))
 
     dl = DataLoader(ds, batch_size=int(cfg.kd.batch_size), shuffle=True,
                     num_workers=2, pin_memory=True, collate_fn=_collate)
