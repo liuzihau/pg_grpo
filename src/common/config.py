@@ -9,6 +9,8 @@ import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple, Union
 
+import torch
+
 __all__ = [
     "deep_update",
     "load_yaml_with_includes",
@@ -19,6 +21,7 @@ __all__ = [
     "parse_overrides",
     "apply_overrides",
     "save_cfg_lock",
+    "parse_torch_dtype", 
 ]
 
 # -----------------------------
@@ -88,6 +91,24 @@ def cfg_get(obj: Union[dict, AttrDict], path: str, default: Any = None) -> Any:
         if cur is None:
             return default
     return cur
+
+def parse_torch_dtype(name: str):
+    """
+    Map strings to torch dtypes.
+    Supported: bf16|bfloat16, fp16|float16|half, fp32|float32|float, fp8 variants.
+    Falls back to float32 if unknown.
+    """
+    n = str(name).lower()
+    if n in ("bf16", "bfloat16", "bfloat"):
+        return torch.bfloat16
+    if n in ("fp16", "float16", "half"):
+        return torch.float16
+    if n in ("fp32", "float32", "float"):
+        return torch.float32
+    if n in ("fp8", "float8", "e4m3", "e5m2", "fp8_e4m3", "fp8_e5m2"):
+        # Prefer e4m3 if present, else e5m2; fallback to fp16 (safe) if neither exists.
+        return getattr(torch, "float8_e4m3fn", getattr(torch, "float8_e5m2", torch.float16))
+    return torch.float32
 
 # -----------------------------
 # Reproducibility & IDs
