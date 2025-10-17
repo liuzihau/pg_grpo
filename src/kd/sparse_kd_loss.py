@@ -55,4 +55,6 @@ def sparse_kd_kl(
     w = mask_BT.to(kl_topk.dtype)                               # [B,S]
     denom = w.sum().clamp_min(1.0)
     loss = (kl_topk * w).sum() / denom                          # scalar
+    # if distill_temp != 1.0:
+    #     loss = loss * (distill_temp ** 2)   # keep gradient scale (Hinton trick)
     return loss
