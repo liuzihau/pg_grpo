@@ -128,8 +128,8 @@ def hf_prompts(tokenizer, cfg, split: str) -> List[str]:
             continue
         items = []
         print(f"Start loading prompt... {len(ds)} in total")
-        for i, rec in enumerate(ds):
-            if i + 1 % (len(ds)//10) == 0:
+        for i, rec in enumerate(ds[:500]):
+            if (i + 1) % (len(ds[:500])//10) == 0:
                 print(f"loading {i}th prompt...")
             msgs = rec.get(field, rec.get("conversations", rec.get("conversation", [])))
             if not isinstance(msgs, list):
@@ -412,6 +412,7 @@ def main():
 
     # prompts
     prompts_all = hf_prompts(tokenizer, cfg, args.split)
+    print(f"Total prompts: {prompts_all}")
     if not prompts_all:
         raise RuntimeError(f"No prompts from HF split='{args.split}'. Check configs/data.yaml.")
     if args.num_samples > 0:
