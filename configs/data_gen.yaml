@@ -1,0 +1,40 @@
+# configs/data_gen.yaml
+data:
+  source: hf
+  hf_name: allenai/tulu-3-sft-mixture
+  messages_field: messages
+  keep_history: true
+  # If the HF dataset doesn't provide your split, we'll do a manual split below.
+  split: train
+  max_input_len: 4096          # hard budget for prompt tokens (padded left)
+  load_kwargs: {}
+  sample_max: null             # cap how many HF records we read (null = all)
+  manual_splits:               # used ONLY if your HF split is missing
+    train: 10000               # take N prompts into the train pool
+    validation: 1000           # take N prompts into the val pool
+  # (Optional) de-duplication
+  dedupe: true
+
+vllm:
+  tensor_parallel_size: 1
+  dtype: auto
+  gpu_memory_utilization: 0.95
+  max_model_len: 4096          # must be >= data.max_input_len + gen.S
+  # If your GPU is huge (A100 80GB), you can bump these safely.
+
+models:
+  target: Qwen/Qwen3-8B
+  tokenizer: Qwen/Qwen3-8B
+
+gen:
+  S: 64                        # continuation tokens per prompt
+  K: 20                        # top-K logprobs (vLLM 0.11 max is 20)
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  batch_size: 32
+  shard_size: 2000
+  out_dir: data/kd_corpus/qwen8b_S64_topk20
+
+training:
+  seed: 1234
