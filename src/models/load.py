@@ -166,19 +166,29 @@ def _resolve_teacher_name(train_cfg: Any, run_root: Path) -> Optional[str]:
 
 def mark_only_lora_trainable(model) -> tuple[int, int]:
     """
-    Freeze all non-LoRA weights; unfreeze only lora_* params.
+    Freeze all non-LoRA weights; unfreeze only LoRA/adapter weights.
     Returns (num_trainable, num_total).
     """
     num_trainable = 0
     num_total = 0
     for n, p in model.named_parameters():
         num_total += p.numel()
-        is_lora = ("lora_" in n) or ("loraA" in n) or ("lora_B" in n) or ("lora_A" in n)
+        n_low = n.lower()
+        is_lora = ("lora" in n_low) or ("adapter_" in n_low)
         p.requires_grad_(is_lora)
         if is_lora:
             num_trainable += p.numel()
     return num_trainable, num_total
 
+def freeze_all_params(model) -> tuple[int, int]:
+    """
+    Set requires_grad=False for all params. Returns (frozen, total).
+    """
+    total = 0
+    for _, p in model.named_parameters():
+        total += p.numel()
+        p.requires_grad_(False)
+    return total, total
 
 def load_models_for_eval_from_model_dir(
     model_dir: Union[str, Path],

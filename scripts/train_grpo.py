@@ -21,6 +21,7 @@ from src.models.load import (
     load_models_for_eval_from_model_dir,
     load_tokenizer_from_training_cfg,
     mark_only_lora_trainable,
+    freeze_all_params,
     print_model_layer_report,
 
 )
@@ -200,6 +201,29 @@ def main():
         teacher.eval()
         train_cfg, used_cfg_path = kd_cfg, kd_model_dir / "cfg.lock.yaml"
         stage_kind = "kd"
+
+    # Ensure teacher is fully frozen (no grads)
+    freeze_all_params(teacher)
+    teacher.eval()
+
+    # Ensure only LoRA is trainable on the draft
+    if isinstance(draft, PeftModel):
+        # Make sure the active adapter is enabled for training
+        try:
+            # adapter name is usually "default" unless you set a custom name
+            active = getattr(draft, "active_adapter", None) or "default"
+            if hasattr(draft, "set_adapter"):
+                draft.set_adapter(active)
+            if hasattr(draft, "enable_adapter_layers"):
+                draft.enable_adapter_layers()
+        except Exception as _e:
+            # Non-fatal: continue and rely on requires_grad filtering below
+            pass
+
+    # Freeze base & unfreeze only LoRA/adapter weights
+    draft.train()
+
+
 
     # Report layers / LoRA injection
     if bool(cfg_get(cfg, "grpo.print_layers", True)):
