@@ -6,16 +6,16 @@ kd:
   log_every: 20
 
   # optimizer
-  lr: 2.0e-4
+  lr: 1.0e-4
   weight_decay: 0.0
-  warmup_ratio: 0.1
+  warmup_ratio: 0.05
   betas: [0.9, 0.95]
 
   # KD divergence
-  distill_temp: 1.5
-  topk_tail: renorm   # "bucket" | "ignore"
+  distill_temp: 1.0
+  topk_tail: "bucket"   # "bucket" | "ignore"
   # weighting
-  margin_gamma: 0.8
-  margin_center: 0.5
-  w_min: 0.25
-  mismatch_lambda: 0.25
+  margin_gamma: 0.5
+  margin_center: 1.0
+  w_min: 0.2
+  mismatch_lambda: 0.3
