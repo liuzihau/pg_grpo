@@ -1,98 +1,113 @@
 # src/data/pregen_kd_ds.py
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple
 from pathlib import Path
-import json
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+import glob
 import torch
-from torch.utils.data import Dataset
 
-def _load_json(path: Path) -> Dict[str, Any]:
-    with open(path, "r") as f:
-        return json.load(f)
+# ... your PreGeneratedTopKDataset stays the same ...
 
-def _list_pt_shards(split_dir: Path) -> List[Path]:
-    return sorted([p for p in split_dir.glob("*.pt")])
-
-class PreGeneratedTopKDataset(Dataset):
+def _left_pad(seqs: List[List[int]], pad_id: int, max_len: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Reads shards produced by scripts/data_gen.py.
-    Each record contains:
-      - prompt_text: str
-      - cont_len: int
-      - topk_ids:  [S, K] int32
-      - topk_logprobs: [S, K] float32   (teacher log-probs)
+    Left-pad a list of token id sequences to a common length.
+    Returns (input_ids [B, L], attention_mask [B, L]).
     """
-    def __init__(self, root: Path, split: str = "train"):
-        self.root = Path(root)
-        self.split = split
-        self.manifest = _load_json(self.root / "manifest.json")
-        self.S = int(self.manifest.get("S", 64))
-        self.K = int(self.manifest.get("K", 20))
-        self.shards = _list_pt_shards(self.root / split)
-        assert self.shards, f"No shards found in {self.root / split}"
-        # Build global index -> (shard_idx, local_idx)
-        self._index: List[Tuple[int, int]] = []
-        for si, sp in enumerate(self.shards):
-            data = torch.load(sp, map_location="cpu")
-            for j in range(len(data)):
-                self._index.append((si, j))
-        self._shard_cache = {}  # small lazy cache
+    Ls = [len(x) for x in seqs]
+    L = max(Ls) if max_len is None else max_len
+    B = len(seqs)
 
-    def __len__(self):
-        return len(self._index)
+    ids = torch.full((B, L), pad_id, dtype=torch.long)
+    att = torch.zeros((B, L), dtype=torch.long)
+    for i, x in enumerate(seqs):
+        n = min(len(x), L)
+        ids[i, L - n : L] = torch.tensor(x[-n:], dtype=torch.long)
+        att[i, L - n : L] = 1
+    return ids, att
 
-    def _get_shard(self, si: int):
-        if si not in self._shard_cache:
-            self._shard_cache.clear()
-            self._shard_cache[si] = torch.load(self.shards[si], map_location="cpu")
-        return self._shard_cache[si]
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        si, li = self._index[idx]
-        shard = self._get_shard(si)
-        rec = shard[li]
-        return {
-            "prompt_text": rec["prompt_text"],
-            "cont_len": int(rec["cont_len"]),
-            "topk_ids": rec["topk_ids"],               # [S,K] int32 CPU tensor
-            "topk_logprobs": rec["topk_logprobs"],     # [S,K] float32 CPU tensor
-        }
 
 def collate_topk(
+    batch: Sequence[Dict[str, Any]],
     *,
-    batch: List[Dict[str, Any]],
-    tokenizer,
+    tokenizer,                 # not re-tokenizing prompt_text; we use stored prompt_ids
     pad_id: int,
     max_input_len: int,
 ) -> Dict[str, torch.Tensor]:
-    # Tokenize prompts on CPU, left-padded to the longest (and truncated to max_input_len)
-    texts = [b["prompt_text"] for b in batch]
-    enc = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=max_input_len,
-        return_tensors="pt",
-    )
-    input_ids = enc["input_ids"]             # [B, L]
-    attention_mask = enc["attention_mask"]   # [B, L]
+    """
+    Build teacher-forcing inputs:
+      input_ids = prompt_ids + cont_ids[:cont_len-1] (clipped left to max_input_len)
+    Align KD targets to the last S positions of logits:
+      - bottom-align the S×K top-k arrays so rows (S-cont_len: S-1) are valid
+      - cont_mask has 1s only on those bottom 'cont_len' rows (else 0)
+    """
+    B = len(batch)
 
-    S = batch[0]["topk_ids"].shape[0]
-    K = batch[0]["topk_ids"].shape[1]
+    # Per-sample staging
+    input_lists: List[List[int]] = []
+    cont_lens: List[int] = []
+    S_list: List[int] = []     # S is fixed by corpus, but we read per rec to be safe
 
-    topk_ids = torch.stack([b["topk_ids"] for b in batch], dim=0).long()            # [B,S,K]
-    topk_logprobs = torch.stack([b["topk_logprobs"] for b in batch], dim=0).float() # [B,S,K]
-    cont_len = torch.tensor([b["cont_len"] for b in batch], dtype=torch.long)       # [B]
-    # Build mask [B,S]
-    cont_mask = torch.zeros((len(batch), S), dtype=torch.float32)
-    for i, Lc in enumerate(cont_len.tolist()):
-        cont_mask[i, :Lc] = 1.0
+    # We’ll build these then stack: [B, S, K]
+    topk_ids_list: List[torch.Tensor] = []
+    topk_lps_list: List[torch.Tensor] = []
+    cont_mask_list: List[torch.Tensor] = []
 
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "topk_ids": topk_ids,
-        "topk_logprobs": topk_logprobs,
-        "cont_len": cont_len,
-        "cont_mask": cont_mask,
+    for rec in batch:
+        prompt_ids: List[int] = list(rec["prompt_ids"])
+        cont_ids:   List[int] = list(rec["cont_ids"])        # length S with EOS pad
+        cont_len:   int       = int(rec["cont_len"])
+        tk_ids:     torch.Tensor = rec["topk_ids"]           # [S, K], int32
+        tk_lps:     torch.Tensor = rec["topk_logprobs"]      # [S, K], float32
+
+        S = int(len(cont_ids))
+        K = int(tk_ids.shape[1])
+        S_list.append(S)
+        cont_lens.append(cont_len)
+
+        # ---- Build teacher-forcing inputs: prompt + first (cont_len-1) ----
+        prefix_len = max(cont_len - 1, 0)
+        inp = prompt_ids + cont_ids[:prefix_len]
+
+        # clip left to respect max_input_len (keep the most recent tokens)
+        if len(inp) > max_input_len:
+            inp = inp[-max_input_len:]
+        input_lists.append(inp)
+
+        # ---- Bottom-align KD tables to match logits[:, -S:, :] ----
+        # rows [0 : S - cont_len) => invalid (masked), rows [S-cont_len : S) => valid continuation steps
+        tk_ids = tk_ids.to(torch.long)            # [S, K]
+        tk_lps = tk_lps.to(torch.float32)         # [S, K]
+
+        # Create empty bottom-aligned buffers
+        ids_btm = torch.zeros((S, K), dtype=torch.long)
+        lps_btm = torch.full((S, K), -1e30, dtype=torch.float32)
+        if cont_len > 0:
+            ids_btm[S - cont_len : S, :] = tk_ids[:cont_len, :]
+            lps_btm[S - cont_len : S, :] = tk_lps[:cont_len, :]
+
+        mask = torch.zeros((S,), dtype=torch.float32)
+        if cont_len > 0:
+            mask[S - cont_len : S] = 1.0
+
+        topk_ids_list.append(ids_btm)
+        topk_lps_list.append(lps_btm)
+        cont_mask_list.append(mask)
+
+    # Sanity: ensure S is constant across the batch (it should be your corpus S)
+    S_unique = set(S_list)
+    if len(S_unique) != 1:
+        raise ValueError(f"Inconsistent S in batch: {S_unique}")
+    S = S_list[0]
+    K = topk_ids_list[0].shape[1]
+
+    # Left-pad inputs to batch
+    input_ids, attention_mask = _left_pad(input_lists, pad_id=pad_id)
+    # outputs on CPU; main process moves to GPU with non_blocking=True
+    batch_out = {
+        "input_ids": input_ids,                              # [B, L]
+        "attention_mask": attention_mask,                    # [B, L]
+        "cont_len": torch.tensor(cont_lens, dtype=torch.long),
+        "cont_mask": torch.stack(cont_mask_list, dim=0),     # [B, S] (bottom 1s)
+        "topk_ids": torch.stack(topk_ids_list, dim=0),       # [B, S, K] bottom-aligned
+        "topk_logprobs": torch.stack(topk_lps_list, dim=0),  # [B, S, K] bottom-aligned
     }
+    return batch_out

@@ -1,0 +1,34 @@
+data:
+  source: hf
+  hf_name: allenai/tulu-3-sft-mixture
+  messages_field: messages
+  keep_history: true
+  split: train
+  max_input_len: 4096
+  load_kwargs: {}
+  sample_max: null
+  manual_splits:
+    train: 10000
+    validation: 1000
+  dedupe: true
+vllm:
+  dtype: float16
+  enforce_eager: true
+  kv_cache_dtype: auto
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 3072
+models:
+  target: Qwen/Qwen3-8B
+  tokenizer: Qwen/Qwen3-8B
+gen:
+  batch_size: 4
+  S: 64
+  K: 20
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  shard_size: 2000
+  out_dir: data/kd_corpus/qwen8b_S64_topk20
+training:
+  seed: 1234

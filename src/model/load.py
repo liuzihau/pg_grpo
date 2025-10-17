@@ -1,55 +1,111 @@
-# src/model/load.py
+# src/models/load.py
 from __future__ import annotations
-from typing import Any
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
+
 import torch
-from transformers import AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
-from .lora import LoraCfg
+from src.common.config import load_yaml_with_includes, to_attrdict, cfg_get, parse_torch_dtype
 
-def load_draft_with_lora(
-    base_name: str,
-    tokenizer,
-    lora_cfg: Any,
-    dtype: torch.dtype,
+def _find_training_cfg_path(model_dir: Union[str, Path]) -> Path:
+    """
+    Look for a config snapshot *inside* the model_dir or its parent.
+    Priority:
+      1) model_dir/cfg.lock.yaml
+      2) model_dir/kd_train.yaml or model_dir/grpo_train.yaml
+      3) parent/cfg.lock.yaml
+    """
+    d = Path(model_dir).expanduser().resolve()
+    cands = [
+        d / "cfg.lock.yaml",
+        d / "kd_train.yaml",
+        d / "grpo_train.yaml",
+        d.parent / "cfg.lock.yaml",
+    ]
+    for p in cands:
+        if p.is_file():
+            return p
+    raise FileNotFoundError(
+        f"Could not find a training config in or near: {d}\n"
+        "Expected one of: cfg.lock.yaml, kd_train.yaml, grpo_train.yaml"
+    )
+
+def _infer_stage_kind(cfg: Any) -> str:
+    # If kd.* block exists we call it KD; if grpo.* exists, GRPO; else KD as default
+    if getattr(cfg, "kd", None) is not None:
+        return "kd"
+    if getattr(cfg, "grpo", None) is not None:
+        return "grpo"
+    return "kd"
+
+def load_tokenizer_from_training_cfg(train_cfg: Any):
+    tok_name = cfg_get(train_cfg, "models.tokenizer", None) \
+            or cfg_get(train_cfg, "models.draft", None) \
+            or cfg_get(train_cfg, "models.target", None)
+    if tok_name is None:
+        raise ValueError("Cannot resolve tokenizer name from training cfg (models.tokenizer/draft/target).")
+    tok = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    tok.padding_side = "left"
+    return tok
+
+def load_models_for_eval_from_model_dir(
+    model_dir: Union[str, Path],
+    dtype_name: Optional[str] = None,
     device_map: str = "auto",
-    gradient_checkpointing: bool = True,
-    use_cache: bool = False,
-):
-    model = AutoModelForCausalLM.from_pretrained(
-        base_name,
-        torch_dtype=dtype,
-        device_map=device_map,
-    )
-    # Ensure pad id set on config for left padding
-    if getattr(model.config, "pad_token_id", None) is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = bool(use_cache)
+) -> Tuple[Any, Any, Any, Any, str, Path]:
+    """
+    Returns: (tokenizer, draft_lora_model, teacher_model, train_cfg, stage_kind, cfg_path)
+      - tokenizer: HF tokenizer (left-pad)
+      - draft_lora_model: base draft + LoRA adapter loaded from model_dir
+      - teacher_model: target teacher in eval mode
+      - train_cfg: AttrDict of the saved training cfg
+      - stage_kind: "kd" or "grpo"
+      - cfg_path: resolved config path used
+    """
+    model_dir = Path(model_dir).expanduser().resolve()
+    cfg_path = _find_training_cfg_path(model_dir)
+    raw = load_yaml_with_includes(cfg_path)
+    train_cfg = to_attrdict(raw)
+    stage_kind = _infer_stage_kind(train_cfg)
 
-    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        try:
-            model.gradient_checkpointing_enable()
-        except TypeError:
-            model.gradient_checkpointing_enable(use_reentrant=False)
+    # Resolve names from training cfg (no need to pass via eval cfg)
+    draft_name  = cfg_get(train_cfg, "models.draft", None)
+    target_name = cfg_get(train_cfg, "models.target", None)
+    if draft_name is None or target_name is None:
+        raise ValueError(f"models.draft/models.target missing in training cfg: {cfg_path}")
 
-    # LoRA
-    lc = LoraCfg(
-        r=int(lora_cfg.get("r", 16)),
-        alpha=int(lora_cfg.get("alpha", 32)),
-        dropout=float(lora_cfg.get("dropout", 0.05)),
-        target_modules=list(lora_cfg.get("target_modules", [
-            # Common Qwen/Llama linear names
-            "q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj"
-        ])),
-        bias=str(lora_cfg.get("bias", "none")),
+    # dtype
+    dtype = parse_torch_dtype(dtype_name or cfg_get(train_cfg, "training.dtype", "bf16"))
+
+    # Tokenizer
+    tok = load_tokenizer_from_training_cfg(train_cfg)
+
+    # Load draft base + attach LoRA from model_dir
+    base = AutoModelForCausalLM.from_pretrained(
+        draft_name, torch_dtype=dtype, device_map=device_map
     )
-    peft_conf = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=lc.r,
-        lora_alpha=lc.alpha,
-        lora_dropout=lc.dropout,
-        target_modules=lc.target_modules,
-        bias=lc.bias,
+    # PeftModel.from_pretrained attaches adapters saved via save_pretrained(adapter_dir)
+    try:
+        draft = PeftModel.from_pretrained(base, model_dir)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to attach LoRA from {model_dir}. "
+            f"Make sure this folder contains adapter_config.json + adapter weights. Error: {e}"
+        )
+    if hasattr(draft, "config"):
+        draft.config.use_cache = False
+    draft.eval()  # eval graph for speed; we won’t backprop during eval
+
+    # Load teacher
+    teacher = AutoModelForCausalLM.from_pretrained(
+        target_name, torch_dtype=dtype, device_map=device_map
     )
-    model = get_peft_model(model, peft_conf)
-    return model
+    if hasattr(teacher, "config"):
+        teacher.config.use_cache = False
+    teacher.eval()
+
+    return tok, draft, teacher, train_cfg, stage_kind, cfg_path

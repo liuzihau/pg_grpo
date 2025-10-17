@@ -1,5 +1,0 @@
-logging:
-  project: specdec-two-stage
-  name: qwen0p6_to_8b_vllm_kdgrpo
-  eval_every_kd: 200
-  eval_every_grpo: 1000

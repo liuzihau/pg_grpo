@@ -1,0 +1,30 @@
+# configs/eval.yaml
+# Only dataset + eval knobs; models are read from the training cfg stored in eval.model_dir
+data:
+  source: hf
+  hf_name: allenai/tulu-3-sft-mixture
+  messages_field: messages
+  keep_history: true
+  split: validation
+  max_input_len: 4096
+  load_kwargs: {}
+  sample_max: null
+
+eval:
+  model_dir: outputs/kd/<run_id>/lora   # <- JUST this; contains cfg.lock.yaml or kd_train.yaml
+  num_samples: 256
+  batch_size: 8
+  K: 8
+  max_new: 128
+  temperature: 0.0
+  acceptance_cap: 1.0
+  out_dir: outputs/eval/<run_id>_K8
+
+training:
+  seed: 1234
+  device: cuda
+  dtype: bf16   # optional; if omitted we use training.dtype from the saved cfg
+
+wandb:
+  project: specdec-two-stage
+  run_name: eval_K8
