@@ -15,8 +15,8 @@ from src.common.config import (
 from src.common.io import save_json, timestamp, makedirs
 from src.common.wandb_util import maybe_init_wandb, wandb_log, wandb_finish
 
-from src.model.tokenizer import load_tokenizer_leftpad
-from src.model.load import load_draft_with_lora
+from src.models.tokenizer import load_tokenizer_leftpad
+from src.models.load import load_draft_with_lora
 from src.data.pregen_kd_ds import PreGeneratedTopKDataset, collate_topk
 from src.kd.sparse_kd_loss import sparse_kd_kl
 from src.kd.weights import build_kd_weights
