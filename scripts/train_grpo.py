@@ -320,6 +320,10 @@ def main():
         d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
             out.logits, seqs.to(device), rep_pr_lens, max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
         )
+        if gen_mask_NT.sum().item() == 0:
+            # nothing generated (should be rare); skip to next batch
+            optim.zero_grad(set_to_none=True)
+            continue
 
         # 3) Teacher logprobs on same tokens (no grad)
         with torch.no_grad():
