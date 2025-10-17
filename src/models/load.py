@@ -2,29 +2,116 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
+import json
 
 import torch
-import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel, LoraConfig, get_peft_model
+from peft import get_peft_model, LoraConfig, PeftModel
 
-from src.common.config import load_yaml_with_includes, to_attrdict, cfg_get, parse_torch_dtype
+from src.common.config import (
+    load_yaml_with_includes, to_attrdict, cfg_get, parse_torch_dtype
+)
 
-# ---------- existing helpers (keep yours) ----------
-def _find_training_cfg_path(model_dir: Union[str, Path]) -> Path:
+# ---------------------------
+# KD TRAINING: base + LoRA
+# ---------------------------
+
+def load_draft_with_lora(
+    *,
+    base_name: str,
+    tokenizer,                          # unused here but kept for API compat
+    lora_cfg: Dict[str, Any],
+    dtype: torch.dtype,
+    device_map: Union[str, Dict[str, int]] = "auto",
+    gradient_checkpointing: bool = True,
+    use_cache: bool = False,
+):
+    """
+    Load the draft base model and wrap it with a fresh LoRA adapter for training.
+    Signature kept 100% compatible with scripts/train_kd.py.
+    """
+    model = AutoModelForCausalLM.from_pretrained(
+        base_name,
+        torch_dtype=dtype,
+        device_map=device_map,
+    )
+
+    # Gradient checkpointing & cache flags
+    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "config"):
+        model.config.use_cache = bool(use_cache)
+
+    # Build LoRA config (sensible defaults if some keys are absent)
+    lora_args = {
+        "r":             int(lora_cfg.get("r", 16)),
+        "lora_alpha":    int(lora_cfg.get("alpha", lora_cfg.get("lora_alpha", 32))),
+        "lora_dropout":  float(lora_cfg.get("dropout", lora_cfg.get("lora_dropout", 0.05))),
+        "bias":          str(lora_cfg.get("bias", "none")),
+        "task_type":     "CAUSAL_LM",
+        # if target_modules not specified, default to common QKV/Proj + MLP
+        "target_modules": lora_cfg.get("target_modules", [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ]),
+        # optional: rank pattern / modules_to_save etc.
+        "modules_to_save": lora_cfg.get("modules_to_save", None),
+        "rank_pattern":    lora_cfg.get("rank_pattern", None),
+        "use_rslora":      bool(lora_cfg.get("use_rslora", False)),
+        "use_dora":        bool(lora_cfg.get("use_dora", False)),
+    }
+    # Filter None values that Peft may not like
+    lora_args = {k: v for k, v in lora_args.items() if v is not None}
+    peft_cfg = LoraConfig(**lora_args)
+
+    model = get_peft_model(model, peft_cfg)
+    # Keep train mode; caller sets .train()
+    return model
+
+
+# ---------------------------
+# EVAL HELPERS
+# ---------------------------
+
+def _resolve_adapter_dir(model_dir: Union[str, Path]) -> Tuple[Path, Path]:
+    """
+    Return (run_root, adapter_dir).
+    Accept either:
+      - <run_root>/lora/{adapter files}
+      - <adapter_dir> directly (contains adapter_config.json)
+    """
     d = Path(model_dir).expanduser().resolve()
+    # Direct adapter folder?
+    if (d / "adapter_config.json").is_file() or \
+       (d / "adapter_model.bin").is_file() or \
+       (d / "adapter_model.safetensors").is_file():
+        return d.parent, d
+    # Run root with lora/
+    if (d / "lora" / "adapter_config.json").is_file() or \
+       (d / "lora" / "adapter_model.bin").is_file() or \
+       (d / "lora" / "adapter_model.safetensors").is_file():
+        return d, d / "lora"
+    # Fallback: any lora/ dir
+    if (d / "lora").is_dir():
+        return d, d / "lora"
+    raise FileNotFoundError(
+        f"No LoRA adapter found in {d}. Pass the run root that contains lora/, "
+        "or the adapter folder itself."
+    )
+
+def _find_training_cfg_path(run_root: Path) -> Path:
     cands = [
-        d / "cfg.lock.yaml",
-        d / "kd_train.yaml",
-        d / "grpo_train.yaml",
-        d.parent / "cfg.lock.yaml",
+        run_root / "cfg.lock.yaml",
+        run_root / "kd_train.yaml",
+        run_root / "grpo_train.yaml",
+        run_root.parent / "cfg.lock.yaml",
     ]
     for p in cands:
         if p.is_file():
             return p
     raise FileNotFoundError(
-        f"Could not find a training config in or near: {d}\n"
-        "Expected one of: cfg.lock.yaml, kd_train.yaml, grpo_train.yaml"
+        f"Training config not found near {run_root}. "
+        "Expected cfg.lock.yaml, kd_train.yaml, or grpo_train.yaml."
     )
 
 def _infer_stage_kind(cfg: Any) -> str:
@@ -46,118 +133,93 @@ def load_tokenizer_from_training_cfg(train_cfg: Any):
     tok.padding_side = "left"
     return tok
 
-# ---------- NEW: draft loader with fresh LoRA for KD training ----------
-def _default_lora_targets(model: nn.Module) -> list[str]:
-    """
-    Reasonable defaults for LLaMA/Mistral/Qwen families.
-    If you passed explicit target_modules in cfg.lora.target_modules we will use that instead.
-    """
-    common = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    # Fall back to leaf linear names if none of those exists (other archs).
-    exists = set()
-    for n, m in model.named_modules():
-        leaf = n.split(".")[-1]
-        if isinstance(m, nn.Linear):
-            exists.add(leaf)
-    if any(t in exists for t in common):
-        return common
-    # Fallback: all linear leaves except lm_head
-    return sorted(list({n.split(".")[-1] for n, m in model.named_modules()
-                        if isinstance(m, nn.Linear) and "lm_head" not in n}))
+def _read_json(p: Path) -> Optional[dict]:
+    try:
+        with p.open("r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-def load_draft_with_lora(
-    *,
-    base_name: str,
-    tokenizer,                       # not used here but kept for signature parity / future use
-    lora_cfg: Any,                   # expects fields: r, alpha, dropout, bias, target_modules?
-    dtype: torch.dtype,
-    device_map: str = "auto",
-    gradient_checkpointing: bool = True,
-    use_cache: bool = False,
-):
-    """
-    Load the draft base model and attach a *fresh* LoRA adapter for KD training.
-    Returns a PEFT-wrapped model ready for .train().
-    """
-    base = AutoModelForCausalLM.from_pretrained(
-        base_name,
-        torch_dtype=dtype,
-        device_map=device_map,
-    )
-    if hasattr(base, "config"):
-        base.config.use_cache = use_cache
-    if gradient_checkpointing and hasattr(base, "gradient_checkpointing_enable"):
-        try:
-            base.gradient_checkpointing_enable()
-        except Exception:
-            pass
+def _resolve_teacher_name(train_cfg: Any, run_root: Path) -> Optional[str]:
+    # 1) explicit in training cfg
+    t = cfg_get(train_cfg, "models.target", None)
+    if t:
+        return t
 
-    # Resolve target modules
-    explicit_targets = None
-    if hasattr(lora_cfg, "target_modules"):
-        explicit_targets = list(lora_cfg.target_modules) if lora_cfg.target_modules is not None else None
-    targets = explicit_targets or _default_lora_targets(base)
+    # 2) from kd.pregen_dir in training cfg
+    pregen_dir = cfg_get(train_cfg, "kd.pregen_dir", None)
 
-    # Build LoRA config
-    r = int(getattr(lora_cfg, "r", 16))
-    alpha = int(getattr(lora_cfg, "alpha", 32))
-    dropout = float(getattr(lora_cfg, "dropout", 0.05))
-    bias = getattr(lora_cfg, "bias", "none")
+    # 3) or from train_summary.json written by train_kd
+    if pregen_dir is None:
+        summary = _read_json(run_root / "train_summary.json") or {}
+        pregen_dir = summary.get("pregen_dir")
 
-    peft_cfg = LoraConfig(
-        r=r,
-        lora_alpha=alpha,
-        lora_dropout=dropout,
-        target_modules=targets,
-        bias=bias,
-        task_type="CAUSAL_LM",
-        inference_mode=False,
-    )
+    if pregen_dir:
+        man = Path(pregen_dir).expanduser().resolve() / "manifest.json"
+        m = _read_json(man) or {}
+        # data_gen writes {"model": <teacher_name>, ...}
+        teacher = m.get("model") or m.get("teacher")
+        if teacher:
+            return teacher
 
-    model = get_peft_model(base, peft_cfg)
+    return None
 
-    # Small quality-of-life: ensure lm_head has grads (PEFT keeps base frozen except adapters).
-    if hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Module):
-        for p in model.lm_head.parameters():
-            p.requires_grad_(True)
-
-    model.train()
-    return model
-
-# ---------- existing eval loader (keep yours, unchanged) ----------
 def load_models_for_eval_from_model_dir(
     model_dir: Union[str, Path],
     dtype_name: Optional[str] = None,
     device_map: str = "auto",
 ) -> Tuple[Any, Any, Any, Any, str, Path]:
-    model_dir = Path(model_dir).expanduser().resolve()
-    cfg_path = _find_training_cfg_path(model_dir)
+    """
+    Returns: (tokenizer, draft_lora_model, teacher_model, train_cfg, stage_kind, cfg_path)
+    - tokenizer: left-padded tokenizer inferred from training cfg
+    - draft_lora_model: base draft + attached LoRA from model_dir (or model_dir/lora)
+    - teacher_model: target model (from training cfg or KD manifest)
+    - train_cfg: AttrDict of saved training cfg
+    - stage_kind: "kd" or "grpo"
+    - cfg_path: path to the cfg used
+    """
+    run_root, adapter_dir = _resolve_adapter_dir(model_dir)
+    cfg_path = _find_training_cfg_path(run_root)
+
     raw = load_yaml_with_includes(cfg_path)
     train_cfg = to_attrdict(raw)
     stage_kind = _infer_stage_kind(train_cfg)
 
-    draft_name  = cfg_get(train_cfg, "models.draft", None)
-    target_name = cfg_get(train_cfg, "models.target", None)
-    if draft_name is None or target_name is None:
-        raise ValueError(f"models.draft/models.target missing in training cfg: {cfg_path}")
+    draft_name = cfg_get(train_cfg, "models.draft", None)
+    if draft_name is None:
+        raise ValueError(f"models.draft missing in training cfg: {cfg_path}")
+
+    target_name = _resolve_teacher_name(train_cfg, run_root)
+    if target_name is None:
+        raise ValueError(
+            "Could not resolve teacher model name.\n"
+            f"- Looked in {cfg_path} (models.target) and in KD corpus manifest via kd.pregen_dir/train_summary.json.\n"
+            "Fix by either:\n"
+            "  a) adding models.target to your training cfg, or\n"
+            "  b) ensuring train_summary.json contains 'pregen_dir' with manifest.json {'model': ...}."
+        )
 
     dtype = parse_torch_dtype(dtype_name or cfg_get(train_cfg, "training.dtype", "bf16"))
+
+    # Tokenizer
     tok = load_tokenizer_from_training_cfg(train_cfg)
 
+    # Draft + LoRA
     base = AutoModelForCausalLM.from_pretrained(
         draft_name, torch_dtype=dtype, device_map=device_map
     )
     try:
-        draft = PeftModel.from_pretrained(base, model_dir)
+        draft = PeftModel.from_pretrained(base, adapter_dir)
     except Exception as e:
         raise RuntimeError(
-            f"Failed to attach LoRA from {model_dir}. "
-            f"Make sure this folder contains adapter_config.json + adapter weights. Error: {e}"
+            f"Failed to attach LoRA from {adapter_dir}. "
+            f"Expected adapter_config.json + weights. Error: {e}"
         )
     if hasattr(draft, "config"):
         draft.config.use_cache = False
     draft.eval()
 
+    # Teacher
     teacher = AutoModelForCausalLM.from_pretrained(
         target_name, torch_dtype=dtype, device_map=device_map
     )
