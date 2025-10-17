@@ -12,7 +12,7 @@ data:
 
 eval:
   model_dir: outputs/kd/<run_id>/lora   # <- JUST this; contains cfg.lock.yaml or kd_train.yaml
-  num_samples: 256
+  num_samples: 32
   batch_size: 8
   K: 8
   max_new: 128

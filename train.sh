@@ -12,14 +12,6 @@ python -m scripts.train_kd \
   --wandb --wandb_api_key "$WANDB_API_KEY"
 
 python -m scripts.eval_specdec \
-  --config configs/defaults.yaml \
-  --tokenizer_name Qwen/Qwen3-0.6B \
-  --draft_name Qwen/Qwen3-0.6B \
-  --teacher_name Qwen/Qwen3-8B \
-  --lora_path outputs/kd_lora \
-  --split validation \
-  --num_samples 64 \
-  --K 8 \
-  --max_new 64 \
-  --temperature 0.0
+  --config configs/eval.yaml \
+  --wandb --wandb_api_key "$WANDB_API_KEY"
 
