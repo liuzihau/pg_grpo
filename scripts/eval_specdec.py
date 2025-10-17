@@ -127,9 +127,9 @@ def hf_prompts(tokenizer, cfg, split: str) -> List[str]:
         except Exception:
             continue
         items = []
-        print("Start loading prompt...")
+        print(f"Start loading prompt... {len(ds)} in total")
         for i, rec in enumerate(ds):
-            if i + 1 % 500 == 0:
+            if i + 1 % (len(ds)//10) == 0:
                 print(f"loading {i}th prompt...")
             msgs = rec.get(field, rec.get("conversations", rec.get("conversation", [])))
             if not isinstance(msgs, list):
