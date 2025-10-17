@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse, json, math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-
+from peft import PeftModel
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -179,7 +179,6 @@ def main():
         # (this path shouldn't trigger if your load.py already handles kd cfg gracefully)
         print(f"[warn] primary model loader failed: {e}")
         # minimal fallback path
-        from peft import PeftModel
         raw_kd = load_yaml_with_includes(kd_model_dir / "cfg.lock.yaml")
         kd_cfg = to_attrdict(raw_kd)
         tokenizer = load_tokenizer_from_training_cfg(kd_cfg)
