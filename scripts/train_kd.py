@@ -1,6 +1,6 @@
 # scripts/train_kd.py
 from __future__ import annotations
-import argparse, os, math
+import argparse, os, math, json
 from pathlib import Path
 from typing import Dict, Any
 
@@ -104,7 +104,23 @@ def main():
     )
 
     # ---- Logging ----
-    run = maybe_init_wandb(enabled=bool(args.wandb), api_key=args.wandb_api_key, cfg=cfg)
+    wb_project = cfg_get(cfg, "logging.project", "kd-train")
+    wb_name    = cfg_get(cfg, "logging.name",    "kd_run")
+    wb_mode    = cfg_get(cfg, "logging.mode",    None)      # e.g. "online" | "offline"
+    wb_tags    = cfg_get(cfg, "logging.tags",    None)
+    wb_group   = cfg_get(cfg, "logging.group",   None)
+
+    wb_cfg = json.loads(json.dumps(cfg, default=str))  # make cfg wandb-serializable
+    run = maybe_init_wandb(
+        enabled=bool(args.wandb),
+        api_key=args.wandb_api_key,
+        project=wb_project,
+        name=wb_name,
+        config=wb_cfg,
+        mode=wb_mode,
+        tags=wb_tags,
+        group=wb_group,
+    )
 
     # ---- Train loop ----
     device = torch.device(cfg_get(cfg, "training.device", "cuda"))
@@ -175,7 +191,7 @@ def main():
                 "train/lr": sched.get_last_lr()[0],
                 "train/avg_cont_len": float(batch["cont_len"].float().mean().cpu()),
             }
-            wandb_log(run, logs, step=step)
+            wandb_log(logs, step=step)
             pbar.set_postfix(loss=f"{logs['train/loss']:.3f}",
                              lr=f"{logs['train/lr']:.2e}")
 
@@ -197,7 +213,7 @@ def main():
         },
         out_dir / "train_summary.json",
     )
-    wandb_finish(run)
+    wandb_finish()
     print(f"[DONE] KD LoRA saved at: {outdir}")
 
 
