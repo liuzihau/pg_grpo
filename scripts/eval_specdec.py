@@ -202,16 +202,12 @@ def eval_spec_batch(
     )
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
-    # Extract non-pad slices per row
-    ids = enc["input_ids"]
-    att = enc["attention_mask"]
+    # Build per-row prefix tensors (trim right-pad)
+    ids, att = enc["input_ids"], enc["attention_mask"]
     cur_ids_list = []
     for i in range(ids.size(0)):
-        last_idx = (att[i] == 1).nonzero()
-        if last_idx.numel() == 0:
-            cur_ids_list.append(torch.tensor([pad_id], dtype=torch.long))
-        else:
-            cur_ids_list.append(ids[i, : last_idx[-1].item()+1])
+        L = att[i].sum().item()
+        cur_ids_list.append(ids[i, : max(L, 1)].clone())
 
     B = len(cur_ids_list)
     accepted_total = torch.zeros(B, dtype=torch.long, device=device)
@@ -220,12 +216,15 @@ def eval_spec_batch(
     done           = torch.zeros(B, dtype=torch.bool, device=device)
 
     while True:
-        if done.all(): break
+        if done.all():
+            break
 
+        # Left-pad current prefixes to a batch
         cur_ids_list = [clip_ctx(x.to(device), max_input_len) for x in cur_ids_list]
         inp, attn = left_pad_to_batch(cur_ids_list, pad_id)
         inp = inp.to(device); attn = attn.to(device)
 
+        # Draft proposes up to K tokens per row
         do_sample = temperature > 0.0
         gen_out = draft.generate(
             input_ids=inp,
@@ -239,69 +238,96 @@ def eval_spec_batch(
         )
         proposed_list = []
         for i in range(B):
-            Lpad = (attn[i] == 1).sum().item()
+            Lpad = attn[i].sum().item()
             full = gen_out[i]
-            proposed = full[Lpad: Lpad + K]
+            proposed = full[Lpad : Lpad + K]
             proposed_list.append(proposed.to(device))
 
+        # Build teacher inputs = prefix + proposals (clipped)
         teacher_inp_list = []
         for i in range(B):
             if done[i]:
                 teacher_inp_list.append(cur_ids_list[i]); continue
             merged = torch.cat([cur_ids_list[i], proposed_list[i]], dim=0)
             teacher_inp_list.append(clip_ctx(merged, max_input_len))
+
         t_inp, t_attn = left_pad_to_batch(teacher_inp_list, pad_id)
         t_inp = t_inp.to(device); t_attn = t_attn.to(device)
 
-        tout = teacher(input_ids=t_inp, attention_mask=t_attn, use_cache=False)
-        t_logits = tout.logits
+        # One teacher forward and (for q) one draft forward on the same merged inputs
+        t_logits = teacher(input_ids=t_inp, attention_mask=t_attn, use_cache=False).logits
+        d_logits = draft(  input_ids=t_inp, attention_mask=t_attn, use_cache=False).logits
 
-        t_top1_list = []
+        # For each row, verify up to first reject with stochastic acceptance
         for i in range(B):
             if done[i]:
-                t_top1_list.append(torch.empty(0, dtype=torch.long, device=device))
                 continue
-            L_eff = (t_attn[i] == 1).sum().item()
-            T_i = min(K, proposed_list[i].numel())
+
+            L_eff   = int(t_attn[i].sum().item())          # effective length of merged row
+            T_i     = min(K, proposed_list[i].numel())
             if T_i == 0:
-                t_top1_list.append(torch.empty(0, dtype=torch.long, device=device))
+                done[i] = True
                 continue
-            slice_logits = t_logits[i, L_eff - T_i : L_eff, :]
-            t_top1 = slice_logits.argmax(dim=-1)
-            t_top1_list.append(t_top1)
 
-        for i in range(B):
-            if done[i]: continue
-            prop = proposed_list[i]; t_top1 = t_top1_list[i]
-            T_i = t_top1.numel()
-            if T_i == 0:
-                done[i] = True; continue
+            # Slices that correspond to the K proposal steps
+            t_slice = t_logits[i, L_eff - T_i : L_eff, :]   # [T_i, V]
+            d_slice = d_logits[i, L_eff - T_i : L_eff, :]   # [T_i, V]
+            prop    = proposed_list[i]                      # [T_i]
 
-            acc_in_chunk, mismatch_seen = 0, False
+            accepted_in_chunk = 0
+            # log-softmax once for numerical stability
+            t_logp = t_slice.log_softmax(dim=-1)            # [T_i, V]
+            d_logp = d_slice.log_softmax(dim=-1)            # [T_i, V]
+
             for t in range(T_i):
                 compared_total[i] += 1
-                if t_top1[t].item() == prop[t].item() and not mismatch_seen:
-                    acc_in_chunk += 1
+                y = int(prop[t].item())                     # proposed token id
+                log_p_y = t_logp[t, y]
+                log_q_y = d_logp[t, y]
+                # a = min(1, p/q) = exp(min(0, log p - log q))
+                accept_prob = torch.exp(torch.minimum(torch.tensor(0.0, device=device), log_p_y - log_q_y))
+                if torch.rand((), device=device) <= accept_prob:
+                    # accept proposal y
+                    cur_ids_list[i] = torch.cat([cur_ids_list[i], prop[t : t+1]], dim=0)
+                    accepted_total[i] += 1
+                    accepted_in_chunk += 1
+                    if accepted_total[i].item() >= max_new_tokens:
+                        done[i] = True
+                        break
                 else:
-                    mismatch_seen = True
+                    # reject -> append ONE teacher token from residual r ∝ [p - q]_+ (fallback to p)
+                    p_probs = t_logp[t].exp()
+                    q_probs = d_logp[t].exp()
+                    resid   = (p_probs - q_probs).clamp_min(0)
+                    mass    = resid.sum()
+                    if mass <= 1e-8:
+                        # degenerate residual → sample from teacher
+                        z = torch.multinomial(p_probs, 1).squeeze(0)
+                    else:
+                        z = torch.multinomial(resid / mass, 1).squeeze(0)
+                    cur_ids_list[i] = torch.cat([cur_ids_list[i], z[None]], dim=0)
+                    # stop verifying current chunk after first reject
                     break
 
-            if acc_in_chunk > 0:
-                accepted_total[i] += acc_in_chunk
-                cur_ids_list[i] = torch.cat([cur_ids_list[i], prop[:acc_in_chunk].detach()], dim=0)
-
             teacher_calls[i] += 1
+
+            # If nothing was accepted and we appended a residual token, we still made progress.
+            # If everything was accepted (no reject), we appended K proposal tokens and will proceed.
+
             if accepted_total[i].item() >= max_new_tokens:
                 done[i] = True
 
         if (accepted_total >= max_new_tokens).all():
             break
 
+    # Metrics
     compared_total = compared_total.clamp_min(1)
-    alpha_accept = (accepted_total.float() / compared_total.float()).mean().item()
-    goodput      = (accepted_total.float() / teacher_calls.clamp_min(1).float()).mean().item()
-    avg_span     = (accepted_total.float() / teacher_calls.clamp_min(1).float()).mean().item()
-    reject_rate  = (1.0 - (accepted_total.float() / compared_total.float())).mean().item()
+    teacher_calls  = teacher_calls.clamp_min(1)
+
+    alpha_accept   = (accepted_total.float() / compared_total.float()).mean().item()
+    goodput        = (accepted_total.float() / teacher_calls.float()).mean().item()
+    avg_span       = goodput  # mean accepted tokens per teacher call
+    reject_rate    = (1.0 - accepted_total.float() / compared_total.float()).mean().item()
 
     return {
         "alpha_accept": alpha_accept,
