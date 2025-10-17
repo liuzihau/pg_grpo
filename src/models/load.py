@@ -251,3 +251,91 @@ def load_base_draft_from_training_cfg(
         model.config.use_cache = False
     model.eval()
     return model
+
+
+# --- LoRA / parameter reporting helpers --------------------------------------
+def _count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return trainable, total
+
+def _collect_lora_parents_from_state_dict(model):
+    """
+    Collect parent module names that have LoRA params.
+    Works for typical PEFT keys: *.lora_A.*, *.lora_B.*, *.lora_embedding_*.
+    """
+    parents = set()
+    for k in model.state_dict().keys():
+        if "lora_A" in k or "lora_B" in k or "lora_embedding_" in k or ".lora_" in k:
+            # normalize: strip the last 2 segments for lora_[AB].weight etc.
+            parts = k.split(".")
+            # find the 'lora_*' segment and drop everything from there
+            try:
+                idx = next(i for i, p in enumerate(parts) if p.startswith("lora"))
+                parent = ".".join(parts[:idx])
+            except StopIteration:
+                # fallback: drop the last segment
+                parent = ".".join(parts[:-1])
+            if parent:
+                parents.add(parent)
+    return sorted(parents)
+
+def print_model_layer_report(model, title="Model", limit=40, only_lora=True):
+    """
+    Print a compact report:
+      - trainable vs total params
+      - LoRA-injected parent modules (first/last N=limit//2 to keep it readable)
+    If only_lora=False, it also prints all leaf module names (capped by limit).
+    """
+    print(f"\n[report] {title}")
+    trainable, total = _count_params(model)
+    print(f"  params: trainable={trainable:,}  total={total:,}")
+
+    # Prefer a PEFT-aware message if available
+    try:
+        from peft import PeftModel  # type: ignore
+        is_peft = isinstance(model, PeftModel)
+    except Exception:
+        is_peft = False
+
+    lora_parents = _collect_lora_parents_from_state_dict(model)
+    if lora_parents:
+        print(f"  LoRA-injected modules: {len(lora_parents)}")
+        if len(lora_parents) <= limit:
+            for name in lora_parents:
+                print(f"    - {name}")
+        else:
+            head = lora_parents[: limit // 2]
+            tail = lora_parents[-(limit // 2) :]
+            for name in head:
+                print(f"    - {name}")
+            print(f"    ... ({len(lora_parents) - len(head) - len(tail)} more) ...")
+            for name in tail:
+                print(f"    - {name}")
+    else:
+        if is_peft:
+            print("  [note] PEFT model detected but no LoRA keys in state_dict (unusual).")
+        else:
+            print("  No LoRA adapters detected.")
+
+    if not only_lora:
+        # dump a capped list of all leaf modules
+        leaf_names = []
+        for name, module in model.named_modules():
+            # leaf: no submodules
+            if not any(True for _ in module.children()):
+                leaf_names.append(name)
+        leaf_names = sorted(set(leaf_names))
+        print(f"  Leaf modules: {len(leaf_names)}")
+        if len(leaf_names) <= limit:
+            for name in leaf_names:
+                print(f"    * {name}")
+        else:
+            head = leaf_names[: limit // 2]
+            tail = leaf_names[-(limit // 2) :]
+            for name in head:
+                print(f"    * {name}")
+            print(f"    ... ({len(leaf_names) - len(head) - len(tail)} more) ...")
+            for name in tail:
+                print(f"    * {name}")
+    print("")

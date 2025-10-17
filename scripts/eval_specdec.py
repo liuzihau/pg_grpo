@@ -12,7 +12,7 @@ from src.common.config import (
 )
 from src.common.io import save_json, makedirs, timestamp
 from src.common.wandb_util import maybe_init_wandb, wandb_log, wandb_finish
-from src.models.load import load_models_for_eval_from_model_dir, load_base_draft_from_training_cfg
+from src.models.load import load_models_for_eval_from_model_dir, load_base_draft_from_training_cfg, print_model_layer_report
 from src.data.prompts import load_prompts_for_split, make_manual_splits, truncate_prompt_by_tokens
 from src.specdec.sim import eval_spec_batch_prob
 
@@ -205,6 +205,7 @@ def main():
     max_input_len = int(cfg_get(data_cfg_for_eval, "data.max_input_len", cfg.data.max_input_len))
 
     # -------- Pass 1: FINETUNED (LoRA) --------
+    print_model_layer_report(ft_draft, title="Eval draft (finetuned LoRA)", limit=60, only_lora=True)
     metrics_ft = _eval_one_variant(
         label="finetuned",
         tokenizer=tokenizer, draft=ft_draft, teacher=teacher, device=device,
@@ -233,9 +234,11 @@ def main():
     # -------- Pass 2: BASE draft (pre-finetune), if requested --------
     compare = bool(cfg_get(cfg, "eval.compare_with_base", True))
     if compare:
+        
         base_draft = load_base_draft_from_training_cfg(
             train_cfg, dtype_name=str(dtype).split(".")[-1], device_map="auto"
         )
+        print_model_layer_report(base_draft, title="Eval draft (BASE, no LoRA)", limit=60, only_lora=True)
         metrics_base = _eval_one_variant(
             label="base",
             tokenizer=tokenizer, draft=base_draft, teacher=teacher, device=device,
