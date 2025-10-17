@@ -25,6 +25,12 @@ grpo:
   acceptance_cap: 1.0
   grad_accum_steps: 1
   log_every: 20
+  teacher_device: cpu         # "auto" (default GPU) or "cpu" to fully offload teacher
+  teacher_8bit: false         # set true if you have bitsandbytes and want GPU 8-bit teacher
+  group_size: 4               # reduce if still tight on memory
+  batch_size: 2               # reduce if still tight on memory
+  max_new: 64                 # reduce max_new to trim sequence length
+
 
   # regularization
   kl_ref: teacher             # teacher | draft_init | none

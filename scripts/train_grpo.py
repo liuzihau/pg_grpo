@@ -40,9 +40,12 @@ class PromptDataset(Dataset):
     def __len__(self): return len(self.prompts)
     def __getitem__(self, i): return self.prompts[i]
 
+
 def _prepare_prompts(tokenizer, prompts: List[str], max_input_len: int, S: int) -> List[str]:
+    # ensure prompt + max_new <= max_input_len
+    cushion = 8
+    budget = max(1, int(max_input_len) - int(S) - cushion)
     out: List[str] = []
-    budget = max(1, max_input_len - 1)  # conservative cushion
     for p in prompts:
         out.append(truncate_prompt_by_tokens(tokenizer, p, budget))
     return out
@@ -201,9 +204,59 @@ def main():
         train_cfg, used_cfg_path = kd_cfg, kd_model_dir / "cfg.lock.yaml"
         stage_kind = "kd"
 
+
+    # ---- teacher memory policy ----
+    td = str(cfg_get(cfg, "grpo.teacher_device", "auto")).lower()
+    use_8bit = bool(cfg_get(cfg, "grpo.teacher_8bit", False))
+    if td == "cpu":
+        teacher.to("cpu")
+        torch.cuda.empty_cache()
+    else:
+        if use_8bit:
+            try:
+                # reload teacher in 8-bit on GPU
+                from transformers import AutoModelForCausalLM
+                # resolve teacher name again (already used inside loader)
+                try:
+                    from src.models.load import _resolve_teacher_name as _resolve_tname
+                    run_root = Path(cfg.grpo.base_model_dir).expanduser().resolve()
+                    teacher_name = _resolve_tname(train_cfg, run_root)
+                except Exception:
+                    teacher_name = None
+                if teacher_name is None:
+                    # fall back to the already-loaded teacher
+                    pass
+                else:
+                    del teacher
+                    torch.cuda.empty_cache()
+                    teacher = AutoModelForCausalLM.from_pretrained(
+                        teacher_name, load_in_8bit=True, device_map="auto"
+                    )
+            except Exception as e:
+                print(f"[warn] 8-bit teacher load failed, using bf16 on GPU: {e}")
+
+
     # Ensure teacher is fully frozen (no grads)
     freeze_all_params(teacher)
     teacher.eval()
+
+    # ---- draft: only LoRA trains + checkpointing ----
+    if hasattr(draft, "gradient_checkpointing_enable"):
+        draft.gradient_checkpointing_enable()
+    # PEFT base (robust across PEFT versions)
+    for node in (getattr(draft, "base_model", None),
+                getattr(getattr(draft, "base_model", None), "model", None)):
+        if node is not None and hasattr(node, "gradient_checkpointing_enable"):
+            node.gradient_checkpointing_enable()
+
+    # no KV cache during training
+    if hasattr(draft, "config"):
+        draft.config.use_cache = False
+        if hasattr(draft, "enable_input_require_grads"):
+            try:
+                draft.enable_input_require_grads()
+            except Exception:
+                pass
 
     # Ensure only LoRA is trainable on the draft
     if isinstance(draft, PeftModel):
