@@ -129,7 +129,7 @@ def hf_prompts(tokenizer, cfg, split: str) -> List[str]:
         items = []
         print(f"Start loading prompt... {len(ds)} in total")
         for i, rec in enumerate(ds[:500]):
-            if (i + 1) % (len(ds[:500])//10) == 0:
+            if (i + 1) % (max(1, len(ds[:500])//10)) == 0:
                 print(f"loading {i}th prompt...")
             msgs = rec.get(field, rec.get("conversations", rec.get("conversation", [])))
             if not isinstance(msgs, list):
