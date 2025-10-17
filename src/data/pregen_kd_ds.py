@@ -1,85 +1,98 @@
+# src/data/pregen_kd_ds.py
 from __future__ import annotations
-import os, json
 from typing import List, Dict, Any, Tuple
+from pathlib import Path
+import json
 import torch
 from torch.utils.data import Dataset
 
+def _load_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return json.load(f)
+
+def _list_pt_shards(split_dir: Path) -> List[Path]:
+    return sorted([p for p in split_dir.glob("*.pt")])
+
 class PreGeneratedTopKDataset(Dataset):
-    def __init__(self, root: str):
-        super().__init__()
-        self.root = root
-        man = os.path.join(root, "manifest.json")
-        if not os.path.exists(man):
-            raise FileNotFoundError(f"manifest.json not found in {root}")
-        with open(man, "r") as f:
-            self.manifest = json.load(f)
-        self.cum = []
-        c = 0
-        for s in self.manifest["shards"]:
-            self.cum.append((c, s["path"], s["size"]))
-            c += s["size"]
-        self.total = c
-        self._cache = {"path": None, "items": None}
+    """
+    Reads shards produced by scripts/data_gen.py.
+    Each record contains:
+      - prompt_text: str
+      - cont_len: int
+      - topk_ids:  [S, K] int32
+      - topk_logprobs: [S, K] float32   (teacher log-probs)
+    """
+    def __init__(self, root: Path, split: str = "train"):
+        self.root = Path(root)
+        self.split = split
+        self.manifest = _load_json(self.root / "manifest.json")
+        self.S = int(self.manifest.get("S", 64))
+        self.K = int(self.manifest.get("K", 20))
+        self.shards = _list_pt_shards(self.root / split)
+        assert self.shards, f"No shards found in {self.root / split}"
+        # Build global index -> (shard_idx, local_idx)
+        self._index: List[Tuple[int, int]] = []
+        for si, sp in enumerate(self.shards):
+            data = torch.load(sp, map_location="cpu")
+            for j in range(len(data)):
+                self._index.append((si, j))
+        self._shard_cache = {}  # small lazy cache
 
-    def __len__(self): return self.total
+    def __len__(self):
+        return len(self._index)
 
-    def _load(self, path: str):
-        items = torch.load(os.path.join(self.root, path), map_location="cpu")
-        self._cache = {"path": path, "items": items}
+    def _get_shard(self, si: int):
+        if si not in self._shard_cache:
+            self._shard_cache.clear()
+            self._shard_cache[si] = torch.load(self.shards[si], map_location="cpu")
+        return self._shard_cache[si]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        for start, path, size in self.cum:
-            if start <= idx < start+size:
-                if self._cache["path"] != path:
-                    self._load(path)
-                return self._cache["items"][idx - start]
-        raise IndexError(idx)
+        si, li = self._index[idx]
+        shard = self._get_shard(si)
+        rec = shard[li]
+        return {
+            "prompt_text": rec["prompt_text"],
+            "cont_len": int(rec["cont_len"]),
+            "topk_ids": rec["topk_ids"],               # [S,K] int32 CPU tensor
+            "topk_logprobs": rec["topk_logprobs"],     # [S,K] float32 CPU tensor
+        }
 
-def left_pad(ids_list: List[torch.Tensor], pad_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    B = len(ids_list)
-    L = max(x.numel() for x in ids_list)
-    out = torch.full((B,L), pad_id, dtype=torch.long)
-    mask = torch.zeros((B,L), dtype=torch.long)
-    for i, x in enumerate(ids_list):
-        l = x.numel()
-        out[i, -l:] = x
-        mask[i, -l:] = 1
-    return out, mask
+def collate_topk(
+    *,
+    batch: List[Dict[str, Any]],
+    tokenizer,
+    pad_id: int,
+    max_input_len: int,
+) -> Dict[str, torch.Tensor]:
+    # Tokenize prompts on CPU, left-padded to the longest (and truncated to max_input_len)
+    texts = [b["prompt_text"] for b in batch]
+    enc = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max_input_len,
+        return_tensors="pt",
+    )
+    input_ids = enc["input_ids"]             # [B, L]
+    attention_mask = enc["attention_mask"]   # [B, L]
 
-def collate_topk(batch, pad_id: int, draft_dtype: torch.dtype = torch.float32):
-    B = len(batch)
-    S = max(int(b["cont_len"]) for b in batch)
-    K = int(batch[0]["topk_ids"].shape[1])
+    S = batch[0]["topk_ids"].shape[0]
+    K = batch[0]["topk_ids"].shape[1]
 
-    max_prompt = max(len(b["prompt_ids"]) for b in batch)
-
-    input_ids      = torch.full((B, max_prompt + S), pad_id, dtype=torch.long)
-    attention_mask = torch.zeros_like(input_ids)
-    cont_mask      = torch.zeros((B, S), dtype=torch.float32)
-    topk_ids       = torch.zeros((B, S, K), dtype=torch.long)
-    topk_logprobs  = torch.full((B, S, K), -1e30, dtype=torch.float32)
-    cont_len       = torch.zeros((B,), dtype=torch.long)
-
-    for i, b in enumerate(batch):
-        pids = torch.tensor(b["prompt_ids"], dtype=torch.long)
-        Lp = pids.numel()
-        input_ids[i, :Lp] = pids
-        attention_mask[i, :Lp] = 1
-
-        Si = min(S, int(b["cont_len"]))
-        cont_len[i] = Si
-        cont_mask[i, :Si] = 1
-
-        ids = b["topk_ids"][:Si].to(torch.long)
-        lps = b["topk_logprobs"][:Si].to(torch.float32)
-        topk_ids[i, :Si] = ids
-        topk_logprobs[i, :Si] = lps
+    topk_ids = torch.stack([b["topk_ids"] for b in batch], dim=0).long()            # [B,S,K]
+    topk_logprobs = torch.stack([b["topk_logprobs"] for b in batch], dim=0).float() # [B,S,K]
+    cont_len = torch.tensor([b["cont_len"] for b in batch], dtype=torch.long)       # [B]
+    # Build mask [B,S]
+    cont_mask = torch.zeros((len(batch), S), dtype=torch.float32)
+    for i, Lc in enumerate(cont_len.tolist()):
+        cont_mask[i, :Lc] = 1.0
 
     return {
-        "input_ids": input_ids,              # CPU tensors
+        "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "cont_mask": cont_mask,
         "topk_ids": topk_ids,
         "topk_logprobs": topk_logprobs,
         "cont_len": cont_len,
+        "cont_mask": cont_mask,
     }

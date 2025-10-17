@@ -1,60 +1,63 @@
+# src/kd/sparse_kd_loss.py
 from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-def _log_softmax_all(logits):  # [B,T,V]
-    return logits.log_softmax(dim=-1)
+def _safe_log(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    return torch.log(torch.clamp(x, min=eps))
 
-@torch.compile(dynamic=True, fullgraph=False)  # optional if PyTorch 2.x; remove if troublesome
 def sparse_kd_kl(
     *,
-    d_logits_BT_V: Tensor,          # [B, S, V] draft logits (REQUIRES GRAD)
-    topk_ids_BTK: Tensor,           # [B, S, K] teacher top-K token ids (int64/long)
-    topk_logprobs_BTK: Tensor,      # [B, S, K] teacher logprobs for those ids (float32)
-    mask_BT: Tensor,                # [B, S] weights/mask (float32), 0 masks token out
-    distill_temp: float = 1.0,      # temperature on both sides
-    tail_mode: str = "renorm",      # "renorm" | "bucket"
-) -> Tensor:
+    d_logits_BT_V: torch.Tensor,        # [B,S,V]
+    topk_ids_BTK: torch.Tensor,         # [B,S,K] (int)
+    topk_logprobs_BTK: torch.Tensor,    # [B,S,K] (float, teacher log-probs)
+    mask_BT: torch.Tensor,              # [B,S]   (0/1 or weights)
+    distill_temp: float = 1.0,
+    tail_mode: str = "bucket",          # "bucket" | "ignore"
+) -> torch.Tensor:
     """
-    KL(P_topK || Q) approximated on teacher top-K.
-    - P_topK: teacher logprobs restricted to top-K, renormalized so sum=1.
-    - Q: draft full softmax; we only gather log Q at those ids.
-
-    Returns a scalar (mean over unmasked tokens).
+    KL(teacher || student), where teacher is given as sparse top-K + tail mass.
+    We compute student log_probs over full vocab, gather top-K, and build a "tail bucket".
+    Loss is averaged over (masked) tokens.
     """
-    assert d_logits_BT_V.requires_grad, "draft logits must require grad"
-
     B, S, V = d_logits_BT_V.shape
     K = topk_ids_BTK.shape[-1]
+    T = float(distill_temp)
 
-    # 1) Teacher top-K -> probabilities with (optional) temperature
-    #    log p_i* = log p_i / T  then renorm over K
-    lp = topk_logprobs_BTK / max(distill_temp, 1e-6)              # [B,S,K]
-    lp = lp - torch.logsumexp(lp, dim=-1, keepdim=True)           # log-normalize
-    p = lp.exp()                                                  # [B,S,K], sum=1 over K
+    # Student log-probs (optionally temperature on student)
+    log_s = F.log_softmax(d_logits_BT_V / T, dim=-1)  # [B,S,V]
+    # Gather top-K student log-probs
+    log_s_topk = torch.gather(log_s, dim=-1, index=topk_ids_BTK)  # [B,S,K]
+    s_topk = torch.exp(log_s_topk)                                # [B,S,K]
+    s_topk_sum = torch.clamp(s_topk.sum(dim=-1), 0.0, 1.0)        # [B,S]
+    s_tail = torch.clamp(1.0 - s_topk_sum, 0.0, 1.0)              # [B,S]
 
-    # 2) Draft log-softmax over full vocab (with temperature)
-    logq_all = torch.log_softmax(d_logits_BT_V / max(distill_temp, 1e-6), dim=-1)  # [B,S,V]
+    # Teacher probs
+    t_topk = torch.exp(topk_logprobs_BTK)                         # [B,S,K]
+    t_topk_sum = torch.clamp(t_topk.sum(dim=-1), 0.0, 1.0)        # [B,S]
+    t_tail = torch.clamp(1.0 - t_topk_sum, 0.0, 1.0)              # [B,S]
 
-    # 3) Gather log Q at teacher's top-K ids
-    logq_topk = torch.gather(logq_all, dim=-1, index=topk_ids_BTK.long())          # [B,S,K]
+    # Optionally retemper the teacher (approximate by re-normalizing over topk+tail)
+    if T != 1.0:
+        # raise teacher probs to power (1/T) and renormalize including tail bucket
+        t_topk = torch.clamp(t_topk, 1e-40, 1.0)
+        t_tail = torch.clamp(t_tail, 1e-40, 1.0)
+        t_topk_T = t_topk.pow(1.0 / T)
+        t_tail_T = t_tail.pow(1.0 / T)
+        Z = t_topk_T.sum(dim=-1) + t_tail_T  # [B,S]
+        t_topk = t_topk_T / Z.unsqueeze(-1)
+        t_tail = t_tail_T / Z
 
-    # 4) Approx KL on top-K: sum_i p_i (log p_i - log q_i)
-    kl_topk = (p * (lp - logq_topk)).sum(dim=-1)                                    # [B,S]
+    # KL = sum_i t_i (log t_i - log s_i) over topk + tail bucket
+    kl_topk = (t_topk * (_safe_log(t_topk) - log_s_topk)).sum(dim=-1)  # [B,S]
+    if tail_mode == "ignore":
+        kl = kl_topk
+    else:
+        kl_tail = t_tail * (_safe_log(t_tail) - _safe_log(s_tail))      # [B,S]
+        kl = kl_topk + kl_tail
 
-    # Optional "bucket" correction: encourage mass outside top-K
-    if tail_mode == "bucket":
-        # teacher's leftover mass outside K is small; reward Q allocating some prob to NONE bucket
-        # We don't have teacher tail distribution; this simply penalizes Q overly peaky on K.
-        # Implement as negative entropy term on Q|topK to spread mass within K
-        qK = logq_topk.exp()                                   # [B,S,K]
-        ent_qK = -(qK * logq_topk).sum(dim=-1)                 # [B,S]
-        kl_topk = kl_topk - 0.01 * ent_qK                      # tiny regularizer
-
-    # 5) Mask + mean
-    w = mask_BT.to(kl_topk.dtype)                               # [B,S]
-    denom = w.sum().clamp_min(1.0)
-    loss = (kl_topk * w).sum() / denom                          # scalar
-    # if distill_temp != 1.0:
-    #     loss = loss * (distill_temp ** 2)   # keep gradient scale (Hinton trick)
+    # Weighted mean over tokens
+    mask = mask_BT.float()
+    denom = torch.clamp(mask.sum(), min=1.0)
+    loss = (kl * mask).sum() / denom
     return loss

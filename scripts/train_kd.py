@@ -1,306 +1,205 @@
+# scripts/train_kd.py
 from __future__ import annotations
-# --- Unsloth optional import (must come BEFORE transformers/peft if used) ---
-import os
-if os.environ.get("USE_UNSLOTH", "0") in ("0","false","False"):
-    USE_UNSLOTH = False
-else:
-    USE_UNSLOTH = True
-    try:
-        import unsloth
-        from unsloth import FastLanguageModel
-        print("🦥 Unsloth enabled.")
-    except Exception as e:
-        print(f"[warn] Unsloth disabled: {e!r}")
-        USE_UNSLOTH = False
+import argparse, os, math
+from pathlib import Path
+from typing import Dict, Any
 
-import os, argparse, math,yaml
-from functools import partial
-from typing import Any, Dict
+import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-import torch, torch.nn as nn
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model
+from src.common.config import (
+    load_yaml_with_includes, to_attrdict, apply_overrides,
+    parse_overrides, set_seed, save_cfg_lock, cfg_get, parse_torch_dtype,
+)
+from src.common.io import save_json, timestamp, makedirs
+from src.common.wandb_util import maybe_init_wandb, wandb_log, wandb_finish
 
-import wandb
-
+from src.model.tokenizer import load_tokenizer_leftpad
+from src.model.load import load_draft_with_lora
 from src.data.pregen_kd_ds import PreGeneratedTopKDataset, collate_topk
 from src.kd.sparse_kd_loss import sparse_kd_kl
+from src.kd.weights import build_kd_weights
+from src.training.optim import build_adamw
+from src.training.schedule import make_warmup_cosine
+from src.training.move import move_to_device_non_blocking
 
-def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    for k, v in b.items():
-        if isinstance(v, dict) and isinstance(a.get(k), dict):
-            a[k] = _deep_update(a[k], v)
-        else:
-            a[k] = v
-    return a
-
-def load_yaml_with_includes(path: str) -> Dict[str, Any]:
-    base_dir = os.path.dirname(os.path.abspath(path))
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f) or {}
-    includes = cfg.pop("include", []) or []
-    merged: Dict[str, Any] = {}
-    for rel in includes:
-        inc_path = rel if os.path.isabs(rel) else os.path.join(base_dir, rel)
-        sub = load_yaml_with_includes(inc_path)
-        _deep_update(merged, sub)
-    _deep_update(merged, cfg)
-    return merged
-
-class Attr(dict):
-    __getattr__ = dict.get
-    __setattr__ = dict.__setitem__
-
-def to_attrdict(d: Dict[str, Any]) -> Any:
-    a = Attr()
-    for k, v in d.items():
-        a[k] = to_attrdict(v) if isinstance(v, dict) else v
-    return a
-
-def load_yaml(path):
-    import yaml
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
-    
-def parse_torch_dtype(name: str):
-    n = str(name).lower()
-    if n in ("bf16", "bfloat16", "bfloat"):
-        import torch
-        return torch.bfloat16
-    if n in ("fp16", "float16", "half"):
-        import torch
-        return torch.float16
-    if n in ("fp32", "float32", "float"):
-        import torch
-        return torch.float32
-    if n in ("fp8",):
-        import torch
-        return getattr(torch, "float8_e4m3fn", getattr(torch, "float8_e5m2", torch.float16))
-    import torch
-    return torch.float32
-
-def cfg_get(obj, path, default=None):
-    cur = obj
-    for key in path.split("."):
-        cur = (cur.get(key) if isinstance(cur, dict) else getattr(cur, key, None))
-        if cur is None:
-            return default
-    return cur
-
-
-def set_seed(seed: int):
-    import random
-    random.seed(seed); torch.manual_seed(seed)
-
-def build_optimizer(model, cfg):
-    lr = float(cfg_get(cfg, "kd.lr", 5e-4))
-    wd = float(cfg_get(cfg, "kd.weight_decay", 0.0))
-    betas = tuple(cfg.kd.get("betas", [0.9, 0.95]))
-    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, betas=betas)
-
-def make_sched(optim, total_steps, warmup_ratio=0.05):
-    warm = max(1, int(total_steps * warmup_ratio))
-    def lr_lambda(s):
-        if s < warm: return s / warm
-        prog = (s - warm) / max(1, total_steps - warm)
-        return 0.5 * (1.0 + math.cos(math.pi * prog))
-    return torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--wandb_api_key", required=True)
+    ap.add_argument("--override", nargs="*", default=[], help="dot.notation=VALUE overrides")
+    ap.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
+    ap.add_argument("--wandb_api_key", default=None)
     args = ap.parse_args()
 
-    # new:
     raw = load_yaml_with_includes(args.config)
-    cfg  = to_attrdict(raw)
+    cfg = to_attrdict(apply_overrides(raw, parse_overrides(args.override)))
     set_seed(int(cfg.training.seed))
-    device = torch.device(cfg_get(cfg, "training.device", "cuda"))
 
-    # wandb
-    wandb.login(key=args.wandb_api_key)
-    wandb.init(project=cfg.logging.project, name=cfg.logging.name, config=cfg)
+    out_dir = Path(cfg.kd.out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = save_cfg_lock(raw, out_dir, filename="cfg.lock.yaml")
+    print(f"[cfg] saved resolved config -> {lock_path}")
 
-    # tokenizer
-    tok_name = cfg.models.get("tokenizer", cfg.draft.name)
-    tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    tokenizer.padding_side = "left"
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    # ---- Tokenizer (must match teacher/draft vocab mapping) ----
+    tok_name = cfg_get(cfg, "models.tokenizer", cfg.models.draft)
+    tokenizer = load_tokenizer_leftpad(tok_name)
 
-    # top-level, picklable collate (CPU only)
-    collate_fn = partial(
-        collate_topk,
-        pad_id=pad_id,
-        draft_dtype=torch.float32,   # keep workers on CPU dtype
+    # ---- Model (draft + LoRA) ----
+    dtype = parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16"))
+    model = load_draft_with_lora(
+        base_name=cfg.models.draft,
+        tokenizer=tokenizer,
+        lora_cfg=cfg.lora,
+        dtype=dtype,
+        device_map="auto",       # single A100: uses that device
+        gradient_checkpointing=bool(cfg.training.get("grad_ckpt", True)),
+        use_cache=False,
     )
-
-
-    # draft model (Unsloth optional; fallback to PEFT)
-    if USE_UNSLOTH:
-        quant_4bit = bool(cfg.lora.get("qlora", False))
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=cfg.draft.name,
-            max_seq_length=cfg.data.max_input_len,
-            dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")),  # use dtype=
-            load_in_4bit=quant_4bit,
-            device_map="auto",
-        )
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=int(cfg.lora.r),
-            lora_alpha=int(cfg.lora.alpha),
-            lora_dropout=float(cfg.lora.dropout),
-            target_modules=list(cfg.lora.target_modules),
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-        cfg.draft.name,
-        dtype=parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16")),
-        device_map="auto",
-        )
-        peft = LoraConfig(
-            task_type="CAUSAL_LM",
-            r=int(cfg.lora.r),
-            lora_alpha=int(cfg.lora.alpha),
-            lora_dropout=float(cfg.lora.dropout),
-            target_modules=list(cfg.lora.target_modules),
-            bias="none",
-        )
-        model = get_peft_model(model, peft)
-
-    if hasattr(model, "get_output_embeddings") and model.get_output_embeddings() is not None:
-        for p in model.get_output_embeddings().parameters():
-            p.requires_grad_(True)
-
-    # for checkpointing + frozen base, make inputs require grad
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    else:
-        # Fallback hook if the method doesn't exist
-        def _require_grads_hook(module, inputs, output):
-            if isinstance(output, torch.Tensor):
-                output.requires_grad_(True)
-        model.get_input_embeddings().register_forward_hook(_require_grads_hook)
-
-    # memory knobs
-    if hasattr(model, "gradient_checkpointing_enable"):
-        try:
-            model.gradient_checkpointing_enable()
-        except TypeError:
-            model.gradient_checkpointing_enable(use_reentrant=False)
-    if hasattr(model, "config"):
-        model.config.use_cache = False
-        if getattr(model.config, "pad_token_id", None) is None:
-            model.config.pad_token_id = tokenizer.pad_token_id
     model.train()
 
+    # ---- Data ----
+    # We re-tokenize prompt_text with *this* tokenizer to ensure vocab consistency.
+    ds_root = Path(cfg.kd.pregen_dir)
+    ds = PreGeneratedTopKDataset(ds_root, split="train")
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
-    # data
-    ds = PreGeneratedTopKDataset(cfg_get(cfg, "kd.pregen_dir", "data/kd_corpus/qwen8b_S64_topk64"))
+    def _collate(batch):
+        # Keep collate on CPU (safe for multiple workers)
+        return collate_topk(
+            batch=batch,
+            tokenizer=tokenizer,
+            pad_id=pad_id,
+            max_input_len=int(cfg.data.max_input_len),
+        )
 
     num_workers = int(cfg_get(cfg, "kd.num_workers", 4))
-    dl = torch.utils.data.DataLoader(
+    dl = DataLoader(
         ds,
-        batch_size=int(cfg_get(cfg, "kd.batch_size", 4)),
+        batch_size=int(cfg.kd.batch_size),
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,
-        collate_fn=collate_fn,
+        collate_fn=_collate,
         drop_last=True,
     )
 
+    # ---- Optim & schedule ----
+    total_steps = int(cfg.kd.total_steps)
+    optim = build_adamw(
+        model,
+        lr=float(cfg.kd.lr),
+        weight_decay=float(cfg.kd.get("weight_decay", 0.0)),
+        betas=tuple(cfg.kd.get("betas", [0.9, 0.95])),
+        eps=1e-8,
+    )
+    sched = make_warmup_cosine(
+        optim,
+        total_steps=total_steps,
+        warmup_ratio=float(cfg.kd.get("warmup_ratio", 0.05)),
+        min_lr=float(cfg.kd.get("min_lr", 0.0)),
+    )
 
-    optim = build_optimizer(model, cfg)
-    sched = make_sched(optim, int(cfg.kd.total_steps), cfg.kd.get("warmup_ratio", 0.05))
+    # ---- Logging ----
+    run = maybe_init_wandb(enabled=bool(args.wandb), api_key=args.wandb_api_key, cfg=cfg)
 
-    total_steps = int(cfg_get(cfg, "kd.total_steps", 2000))
+    # ---- Train loop ----
+    device = torch.device(cfg_get(cfg, "training.device", "cuda"))
+    scaler = None  # BF16 on A100: no need for GradScaler
+
     log_every = int(cfg.kd.log_every)
+    grad_clip = float(cfg.training.get("max_grad_norm", 1.0))
+    acc_steps = int(cfg.kd.get("grad_accum_steps", 1))
+    kd_temp = float(cfg.kd.get("distill_temp", 1.0))
+    tail_mode = str(cfg.kd.get("topk_tail", "bucket"))
 
-    pbar = tqdm(range(total_steps), desc="KD (top-K)", ncols=100)
     it = iter(dl)
+    pbar = tqdm(range(total_steps), desc="KD (top-K)", ncols=100)
     for step in pbar:
         try:
             batch = next(it)
         except StopIteration:
-            it = iter(dl); batch = next(it)
+            it = iter(dl)
+            batch = next(it)
 
-        # move to GPU here (parent process)
-        for k, v in list(batch.items()):
-            if torch.is_tensor(v):
-                batch[k] = v.to(device, non_blocking=True)
+        # Move to GPU in main process only
+        batch = move_to_device_non_blocking(batch, device)
 
+        # Forward
+        out = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            use_cache=False,
+        )
+        logits = out.logits  # [B, L, V]
 
-        out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False)
-        logits = out.logits  # [B,L,V]
         # last S positions predict the S continuation tokens
         S = int(batch["cont_mask"].shape[1])
-        d_logits_BT_V = logits[:, -S:, :]  # [B,S,V]
+        d_logits_BT_V = logits[:, -S:, :]  # [B, S, V]
 
-        # weights
-        with torch.no_grad():
-            # teacher margin from top-K: top1 - top2 (per token)
-            topk = batch["topk_logprobs"]  # [B,S,K] logprobs
-            top2,_ = torch.topk(topk, k=2, dim=-1)
-            margin = top2[..., 0] - top2[..., 1]  # [B,S]
-            mg = cfg.kd.get("margin_gamma", 0.5)
-            mc = cfg.kd.get("margin_center", 1.0)
-            wmin = cfg.kd.get("w_min", 0.2)
-            m = torch.sigmoid(mg * (margin - mc))
-            margin_w = wmin + (1.0 - wmin) * m
-
-            # mismatch vs draft argmax over full vocab
-            d_argmax = d_logits_BT_V.argmax(dim=-1)  # [B,S]
-            t_argmax = torch.gather(batch["topk_ids"], -1, torch.zeros_like(batch["topk_ids"][..., :1]))
-            t_argmax = t_argmax.squeeze(-1)  # top-1 id per step
-            mismatch = (d_argmax != t_argmax).float()
-
-            weights = (margin_w * (1.0 + cfg.kd.get("mismatch_lambda", 0.3) * mismatch)) * batch["cont_mask"]
-
-        loss = sparse_kd_kl(
-            d_logits_BT_V=d_logits_BT_V,              # [B,S,V] from model forward
-            topk_ids_BTK=batch["topk_ids"],           # [B,S,K]
-            topk_logprobs_BTK=batch["topk_logprobs"], # [B,S,K]
-            mask_BT=weights,                          # [B,S]
-            distill_temp=float(cfg.kd.get("distill_temp", 1.0)),
-            tail_mode=str(cfg.kd.get("topk_tail", "renorm")),
+        # Optional per-token weights (margin + mismatch); stays on device
+        weights = build_kd_weights(
+            d_logits_BT_V=d_logits_BT_V,
+            topk_ids_BTK=batch["topk_ids"],
+            topk_logprobs_BTK=batch["topk_logprobs"],
+            cont_mask_BT=batch["cont_mask"].float(),
+            margin_gamma=float(cfg.kd.get("margin_gamma", 0.5)),
+            margin_center=float(cfg.kd.get("margin_center", 1.0)),
+            w_min=float(cfg.kd.get("w_min", 0.2)),
+            mismatch_lambda=float(cfg.kd.get("mismatch_lambda", 0.3)),
         )
 
-        optim.zero_grad(set_to_none=True)
+        loss = sparse_kd_kl(
+            d_logits_BT_V=d_logits_BT_V,
+            topk_ids_BTK=batch["topk_ids"],
+            topk_logprobs_BTK=batch["topk_logprobs"],
+            mask_BT=weights,                # incorporate weights
+            distill_temp=kd_temp,
+            tail_mode=tail_mode,            # "bucket" (default) or "ignore"
+        ) / acc_steps
+
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.training.max_grad_norm))
-        optim.step(); sched.step()
+
+        if (step + 1) % acc_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optim.step()
+            sched.step()
+            optim.zero_grad(set_to_none=True)
 
         if step % log_every == 0:
-            wandb.log({
-                "train/kd_total_loss": float(loss.detach().cpu()),
+            logs = {
+                "train/loss": float(loss.detach().cpu()) * acc_steps,
                 "train/lr": sched.get_last_lr()[0],
                 "train/avg_cont_len": float(batch["cont_len"].float().mean().cpu()),
-            }, step=step)
-            pbar.set_postfix(loss=f"{loss.item():.3f}")
+            }
+            wandb_log(run, logs, step=step)
+            pbar.set_postfix(loss=f"{logs['train/loss']:.3f}",
+                             lr=f"{logs['train/lr']:.2e}")
 
-    # save LoRA/adapters
-    outdir = os.path.join("outputs", "kd_lora")
-    os.makedirs(outdir, exist_ok=True)
+    # ---- Save adapters + training summary ----
+    outdir = out_dir / "lora"
+    outdir.mkdir(parents=True, exist_ok=True)
     try:
-        model.save_pretrained(outdir)
+        model.save_pretrained(str(outdir))
     except Exception:
-        torch.save(model.state_dict(), os.path.join(outdir, "pytorch_model.bin"))
-    wandb.finish()
+        torch.save(model.state_dict(), outdir / "pytorch_model.bin")
+
+    save_json(
+        {
+            "finished_at": timestamp(),
+            "steps": total_steps,
+            "model": cfg.models.draft,
+            "pregen_dir": str(ds_root),
+            "out_dir": str(outdir),
+        },
+        out_dir / "train_summary.json",
+    )
+    wandb_finish(run)
+    print(f"[DONE] KD LoRA saved at: {outdir}")
+
 
 if __name__ == "__main__":
-    import torch.multiprocessing as mp
-    try:
-        if mp.get_start_method(allow_none=True) != "spawn":
-            mp.set_start_method("spawn", force=True)
-    except RuntimeError:
-        pass
     main()

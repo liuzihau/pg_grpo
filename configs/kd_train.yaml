@@ -1,21 +1,48 @@
+# configs/kd_train.yaml
+# ---- DATA (must match what you generated) ----
 kd:
-  use_pregen: true
-  pregen_dir: data/kd_corpus/qwen8b_S64_topk64
-  total_steps: 10000
-  batch_size: 4
-  log_every: 20
-
-  # optimizer
-  lr: 1.0e-4
+  pregen_dir: data/kd_corpus/qwen8b_S64_topk20
+  out_dir: outputs/kd/qwen3_draft_lora
+  batch_size: 8              # per step (we use grad_accum for higher EBS)
+  total_steps: 4000
+  lr: 5.0e-5
   weight_decay: 0.0
-  warmup_ratio: 0.05
   betas: [0.9, 0.95]
-
-  # KD divergence
+  warmup_ratio: 0.05
+  min_lr: 0.0
+  log_every: 20
+  num_workers: 4
+  grad_accum_steps: 2
   distill_temp: 1.0
-  topk_tail: "bucket"   # "bucket" | "ignore"
-  # weighting
+  topk_tail: bucket          # or "ignore"
   margin_gamma: 0.5
   margin_center: 1.0
   w_min: 0.2
   mismatch_lambda: 0.3
+
+data:
+  max_input_len: 4096
+
+models:
+  # Draft must share tokenizer/vocab with teacher family used for data_gen
+  draft: Qwen/Qwen3-1.8B
+  tokenizer: Qwen/Qwen3-1.8B
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  bias: "none"
+  # Good defaults for Qwen/Llama families:
+  target_modules: ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj"]
+
+training:
+  seed: 1234
+  dtype: bf16          # A100-80G => bfloat16
+  device: cuda
+  grad_ckpt: true
+  max_grad_norm: 1.0
+
+logging:
+  project: kd-qwen
+  name: qwen3_1_8b_kd_from_qwen3_8b_topk20

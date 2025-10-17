@@ -16,23 +16,36 @@ data:
   dedupe: true
 
 vllm:
-  tensor_parallel_size: 1
-  dtype: auto
-  gpu_memory_utilization: 0.95
-  max_model_len: 4096          # must be >= data.max_input_len + gen.S
-  # If your GPU is huge (A100 80GB), you can bump these safely.
+  # 4 3090
+  dtype: float16          # weights/compute dtype for 3090
+  enforce_eager: true     # disable torch.compile & CUDA graph capture
+  kv_cache_dtype: auto    # let vLLM pick (bf16 on A100, fp16 on 3090)
+  tensor_parallel_size: 1 # or 2/4 if you really want to shard across 3090s
+  gpu_memory_utilization: 0.85
+  max_model_len: 3072     # safer headroom on 24GB cards (adjust up/down)
+
+  # A100-80G
+  # dtype: bfloat16
+  # enforce_eager: false
+  # kv_cache_dtype: bfloat16
+  # tensor_parallel_size: 1
+  # gpu_memory_utilization: 0.95
+  # max_model_len: 4096
 
 models:
   target: Qwen/Qwen3-8B
   tokenizer: Qwen/Qwen3-8B
 
 gen:
+  # 4 3090
+  batch_size: 4
+  # A100-80G
+  # batch_size: 4
   S: 64                        # continuation tokens per prompt
   K: 20                        # top-K logprobs (vLLM 0.11 max is 20)
   temperature: 0.0
   top_p: 1.0
   top_k: 0
-  batch_size: 32
   shard_size: 2000
   out_dir: data/kd_corpus/qwen8b_S64_topk20
 

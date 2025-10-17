@@ -7,7 +7,9 @@ set -Eeuo pipefail
 # (Optional) run from repo root regardless of where the script is called
 cd "$(dirname "$0")"
 
-python -m scripts.train_kd --config configs/defaults.yaml --wandb_api_key "$WANDB_API_KEY"
+python -m scripts.train_kd \
+  --config configs/kd_train.yaml \
+  --wandb --wandb_api_key "$WANDB_API_KEY"
 
 python -m scripts.eval_specdec \
   --config configs/defaults.yaml \
