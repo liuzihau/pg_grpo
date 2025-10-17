@@ -20,7 +20,9 @@ from src.common.wandb_util import maybe_init_wandb, wandb_log, wandb_finish
 from src.models.load import (
     load_models_for_eval_from_model_dir,
     load_tokenizer_from_training_cfg,
+    mark_only_lora_trainable,
     print_model_layer_report,
+
 )
 from src.data.prompts import load_prompts_for_split, make_manual_splits, truncate_prompt_by_tokens
 from src.training.optim import build_adamw
@@ -106,16 +108,18 @@ def _sample_group(
 def _gather_token_logps_from_forward(
     logits: torch.Tensor,    # [N, L, V]
     seqs: torch.Tensor,      # [N, L]
-    pr_lens: List[int],      # len N
+    pr_lens: List[int],      # len N, prompt token counts
     max_new: int,
+    pad_id: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    From full logits on seqs, extract logp for the *generated* tokens (the next-token
-    logits at each generation step). Returns (logp [N,T], mask [N,T]).
+    Extract log-probs for the generated tokens y_{1:T} given the model's logits.
+    We use the teacher-forcing alignment: logits at pos (p-1+t) predict token at (p+t).
+    Returns (logp [N,T], mask [N,T]).
     """
     N, L, V = logits.shape
     device = logits.device
-    T = max_new
+    T = int(max_new)
 
     # log softmax once
     logp_full = F.log_softmax(logits, dim=-1)  # [N,L,V]
@@ -123,39 +127,24 @@ def _gather_token_logps_from_forward(
     out_logp = torch.zeros((N, T), dtype=logits.dtype, device=device)
     mask = torch.zeros((N, T), dtype=logits.dtype, device=device)
 
-    # length per sequence: count non-pad
-    pad_id = 0  # we don't know pad here; compute by trailing zeros in attn? safer: infer each length
-    # infer length by finding rightmost non-zero token id. This works with HF's pad_id being non-zero; but
-    # to be robust, we just compute "length = first index from left that's non-pad according to attention".
-    # We can reconstruct attention as "seqs != tokenizer.pad_token_id" outside; here we approximate by
-    # taking everything (we will mask positions > actual generated length using pr_lens + gen_len).
-    # Instead we compute generated length per row as len(seqs[i]) - pr_len[i] - left_pad; but seqs are left-padded.
-    # We'll detect non-zero attention by comparing to seqs[0,0] which is a pad id in left-padding; not perfect.
-    # Easiest: compute total length per row as the index of last non-equal to seqs[i,0] when seqs[i,0] is pad.
-    # To keep it simple, assume we only use first pr_len[i]+max_new positions, and mask extra if seq shorter.
+    # true sequence lengths from padding
+    att = (seqs != pad_id).long()             # [N,L]
+    seq_lens = att.sum(dim=1)                 # [N]
+    pr_lens_t = torch.tensor(pr_lens, device=device, dtype=torch.long)  # [N]
+    gen_lens = (seq_lens - pr_lens_t).clamp(min=0, max=T)               # [N]
 
     for i in range(N):
-        p = int(pr_lens[i])
-        # positions for generated tokens in seq:
-        # token at absolute position pos = p, p+1, ..., p+T-1 must exist to compute
-        # logits index to use is pos-1
-        seq_len = int((seqs[i] != (seqs[i, 0].item())).sum().item())  # crude, but works with left-padding
-        # If first token isn't pad (very short padding), fall back to all non-zero
-        if seq_len == 0:
-            seq_len = int((seqs[i] != 0).sum().item())
-        gen_len = max(0, min(T, seq_len - p))
-        if gen_len <= 0:
+        g = int(gen_lens[i])
+        if g <= 0:
             continue
-        pos_range = torch.arange(gen_len, device=device)
-        pos_logits_idx = p - 1 + pos_range  # logits at p-1 predict token at p
-        target_ids = seqs[i, p + pos_range]  # chosen tokens
-
-        lp = logp_full[i, pos_logits_idx, target_ids]
-        out_logp[i, :gen_len] = lp
-        mask[i, :gen_len] = 1.0
+        p = int(pr_lens[i])
+        pos = torch.arange(g, device=device)
+        logits_idx = p - 1 + pos              # predicts token at p+pos
+        tgt_ids = seqs[i, p + pos]
+        out_logp[i, :g] = logp_full[i, logits_idx, tgt_ids]
+        mask[i, :g] = 1.0
 
     return out_logp, mask
-
 
 # ----------------------------------- main -------------------------------------
 
@@ -199,6 +188,9 @@ def main():
         draft = PeftModel.from_pretrained(draft_base, kd_model_dir)
         draft.config.use_cache = False
         draft.train()
+        n_train, n_total = mark_only_lora_trainable(draft)
+        print(f"[grpo] trainable params (LoRA only): {n_train:,} / {n_total:,}")
+        print_model_layer_report(draft, title="GRPO draft (after freezing base)", limit=80, only_lora=True)
         teacher_name = cfg_get(cfg, "grpo.teacher", cfg_get(kd_cfg, "models.target", None)) \
                        or cfg_get(kd_cfg, "models.tokenizer", None)
         teacher = AutoModelForCausalLM.from_pretrained(
@@ -326,16 +318,16 @@ def main():
         att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long().to(device)
         out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
         d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
-            out.logits, seqs.to(device), rep_pr_lens, max_new=max_new
-        )  # [N,T],[N,T]
+            out.logits, seqs.to(device), rep_pr_lens, max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
+        )
 
         # 3) Teacher logprobs on same tokens (no grad)
         with torch.no_grad():
             tout = teacher(input_ids=seqs.to(teacher.device), attention_mask=att.to(teacher.device), use_cache=False)
             t_logp_NT, _ = _gather_token_logps_from_forward(
-                tout.logits.to(d_logp_NT.device), seqs.to(d_logp_NT.device), rep_pr_lens, max_new=max_new
+                tout.logits.to(d_logp_NT.device), seqs.to(d_logp_NT.device), rep_pr_lens, max_new=max_new,
+                pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
             )
-
         # 4) Optional ref logprobs for KL
         if kl_ref == "teacher":
             ref_logp_NT = t_logp_NT
