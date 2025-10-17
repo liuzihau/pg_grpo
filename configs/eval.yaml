@@ -18,6 +18,7 @@ eval:
   max_new: 128
   temperature: 0.0
   acceptance_cap: 1.0
+  compare_with_base: true
   out_dir: outputs/eval/<run_id>_K8
 
 training:

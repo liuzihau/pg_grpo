@@ -228,3 +228,26 @@ def load_models_for_eval_from_model_dir(
     teacher.eval()
 
     return tok, draft, teacher, train_cfg, stage_kind, cfg_path
+
+
+def load_base_draft_from_training_cfg(
+    train_cfg: Any,
+    dtype_name: Optional[str] = None,
+    device_map: str = "auto",
+):
+    """
+    Load ONLY the base 'models.draft' (no LoRA) using the dtype in training cfg
+    (or an override). Returns a HF CausalLM in eval mode with use_cache=False.
+    """
+    draft_name = cfg_get(train_cfg, "models.draft", None)
+    if draft_name is None:
+        raise ValueError("models.draft missing in training cfg; cannot load base draft.")
+
+    dtype = parse_torch_dtype(dtype_name or cfg_get(train_cfg, "training.dtype", "bf16"))
+    model = AutoModelForCausalLM.from_pretrained(
+        draft_name, torch_dtype=dtype, device_map=device_map
+    )
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+    model.eval()
+    return model
