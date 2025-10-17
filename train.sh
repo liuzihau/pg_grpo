@@ -15,3 +15,6 @@ python -m scripts.eval_specdec \
   --config configs/eval.yaml \
   --wandb --wandb_api_key "$WANDB_API_KEY"
 
+python -m scripts.train_grpo \
+  --config configs/grpo_train.yaml \
+  --wandb --wandb_api_key "$WANDB_API_KEY"

@@ -1,183 +1,436 @@
+# scripts/train_grpo.py
 from __future__ import annotations
-import os, argparse, math
+import argparse, json, math
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-import wandb
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model
-from vllm import LLM, SamplingParams
+from transformers import AutoModelForCausalLM
 
-from src.specdec.acceptance import first_reject_mask
-from src.kd.sparse_kd_loss import sparse_kd_kl
+from src.common.config import (
+    load_yaml_with_includes, to_attrdict, apply_overrides, parse_overrides,
+    set_seed, save_cfg_lock, cfg_get, parse_torch_dtype,
+)
+from src.common.io import save_json, timestamp
+from src.common.wandb_util import maybe_init_wandb, wandb_log, wandb_finish
+from src.models.load import (
+    load_models_for_eval_from_model_dir,
+    load_tokenizer_from_training_cfg,
+    print_model_layer_report,
+)
+from src.data.prompts import load_prompts_for_split, make_manual_splits, truncate_prompt_by_tokens
+from src.training.optim import build_adamw
+from src.training.schedule import make_warmup_cosine
+from src.training.move import move_to_device_non_blocking
+from src.reward.boundary import expected_alpha_and_goodput_from_logps
 
-def load_yaml(path):
-    import yaml
-    with open(path,"r") as f: return yaml.safe_load(f)
 
-def set_seed(s): import random; random.seed(s); torch.manual_seed(s)
+# ---------------------------- small prompt dataset ----------------------------
+
+class PromptDataset(Dataset):
+    def __init__(self, prompts: List[str]):
+        self.prompts = prompts
+    def __len__(self): return len(self.prompts)
+    def __getitem__(self, i): return self.prompts[i]
+
+def _prepare_prompts(tokenizer, prompts: List[str], max_input_len: int, S: int) -> List[str]:
+    out: List[str] = []
+    budget = max(1, max_input_len - 1)  # conservative cushion
+    for p in prompts:
+        out.append(truncate_prompt_by_tokens(tokenizer, p, budget))
+    return out
+
+def _left_pad_batch(ids_list: List[List[int]], pad_id: int, max_len: int|None=None) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+    """left-pad lists of ids => (input_ids[B,L], attn[B,L], true_lengths[B])."""
+    Ls = [len(x) for x in ids_list]
+    L = max(Ls) if max_len is None else max_len
+    B = len(ids_list)
+    ids = torch.full((B, L), pad_id, dtype=torch.long)
+    att = torch.zeros((B, L), dtype=torch.long)
+    for i, x in enumerate(ids_list):
+        n = min(len(x), L)
+        ids[i, L - n : L] = torch.tensor(x[-n:], dtype=torch.long)
+        att[i, L - n : L] = 1
+    return ids, att, Ls
+
+def _tokenize_prompts(tokenizer, prompts: List[str], max_input_len: int):
+    enc = tokenizer(
+        prompts, return_tensors=None, padding=False, truncation=True, max_length=max_input_len
+    )
+    ids_list = enc["input_ids"]
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    input_ids, attn, lens = _left_pad_batch(ids_list, pad_id=pad_id)
+    return input_ids, attn, lens, pad_id
+
+
+# ------------------------------ GRPO core utils -------------------------------
+
+@torch.no_grad()
+def _sample_group(
+    model, tokenizer, prompt_ids: torch.Tensor, prompt_attn: torch.Tensor,
+    group_size: int, max_new: int, temperature: float, eos_id: int|None
+) -> Tuple[torch.Tensor, List[int]]:
+    """
+    Repeat each prompt group_size times and sample max_new tokens.
+    Returns sequences [B*G, L_out] and list of prompt lengths (repeated G times).
+    """
+    B, L = prompt_ids.shape
+    # Repeat for group sampling
+    rep_ids  = prompt_ids.repeat_interleave(group_size, dim=0).contiguous()
+    rep_attn = prompt_attn.repeat_interleave(group_size, dim=0).contiguous()
+
+    gen = model.generate(
+        inputs=rep_ids.to(model.device),
+        attention_mask=rep_attn.to(model.device),
+        do_sample=True,
+        temperature=max(1e-6, float(temperature)),
+        max_new_tokens=int(max_new),
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        eos_token_id=eos_id,
+        use_cache=True,
+        return_dict_in_generate=True,
+        output_scores=False,  # we'll recompute logprobs with grads later
+    )
+    seqs = gen.sequences  # [B*G, L_out] (left-padded)
+    # prompt lengths replicate G times
+    # Derive from attention (1s for tokens incl. prompt); stable since we padded left
+    pr_lens = prompt_attn.sum(dim=1).tolist()
+    pr_lens = [x for x in pr_lens for _ in range(group_size)]
+    return seqs, pr_lens
+
+
+def _gather_token_logps_from_forward(
+    logits: torch.Tensor,    # [N, L, V]
+    seqs: torch.Tensor,      # [N, L]
+    pr_lens: List[int],      # len N
+    max_new: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    From full logits on seqs, extract logp for the *generated* tokens (the next-token
+    logits at each generation step). Returns (logp [N,T], mask [N,T]).
+    """
+    N, L, V = logits.shape
+    device = logits.device
+    T = max_new
+
+    # log softmax once
+    logp_full = F.log_softmax(logits, dim=-1)  # [N,L,V]
+
+    out_logp = torch.zeros((N, T), dtype=logits.dtype, device=device)
+    mask = torch.zeros((N, T), dtype=logits.dtype, device=device)
+
+    # length per sequence: count non-pad
+    pad_id = 0  # we don't know pad here; compute by trailing zeros in attn? safer: infer each length
+    # infer length by finding rightmost non-zero token id. This works with HF's pad_id being non-zero; but
+    # to be robust, we just compute "length = first index from left that's non-pad according to attention".
+    # We can reconstruct attention as "seqs != tokenizer.pad_token_id" outside; here we approximate by
+    # taking everything (we will mask positions > actual generated length using pr_lens + gen_len).
+    # Instead we compute generated length per row as len(seqs[i]) - pr_len[i] - left_pad; but seqs are left-padded.
+    # We'll detect non-zero attention by comparing to seqs[0,0] which is a pad id in left-padding; not perfect.
+    # Easiest: compute total length per row as the index of last non-equal to seqs[i,0] when seqs[i,0] is pad.
+    # To keep it simple, assume we only use first pr_len[i]+max_new positions, and mask extra if seq shorter.
+
+    for i in range(N):
+        p = int(pr_lens[i])
+        # positions for generated tokens in seq:
+        # token at absolute position pos = p, p+1, ..., p+T-1 must exist to compute
+        # logits index to use is pos-1
+        seq_len = int((seqs[i] != (seqs[i, 0].item())).sum().item())  # crude, but works with left-padding
+        # If first token isn't pad (very short padding), fall back to all non-zero
+        if seq_len == 0:
+            seq_len = int((seqs[i] != 0).sum().item())
+        gen_len = max(0, min(T, seq_len - p))
+        if gen_len <= 0:
+            continue
+        pos_range = torch.arange(gen_len, device=device)
+        pos_logits_idx = p - 1 + pos_range  # logits at p-1 predict token at p
+        target_ids = seqs[i, p + pos_range]  # chosen tokens
+
+        lp = logp_full[i, pos_logits_idx, target_ids]
+        out_logp[i, :gen_len] = lp
+        mask[i, :gen_len] = 1.0
+
+    return out_logp, mask
+
+
+# ----------------------------------- main -------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--wandb_api_key", required=True)
+    ap.add_argument("--override", nargs="*", default=[])
+    ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--wandb_api_key", default=None)
     args = ap.parse_args()
-    cfg = load_yaml(args.config)
 
-    set_seed(cfg["training"]["seed"])
-    device = torch.device(cfg["training"].get("device","cuda"))
+    raw = load_yaml_with_includes(args.config)
+    cfg = to_attrdict(apply_overrides(raw, parse_overrides(args.override)))
+    set_seed(int(cfg.training.seed))
 
-    wandb.login(key=args.wandb_api_key)
-    wandb.init(project=cfg["logging"]["project"], name=cfg["logging"]["name"], config=cfg)
+    out_dir = Path(cfg.grpo.out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_cfg_lock(raw, out_dir, filename="cfg.lock.yaml")
 
-    tok_name = cfg["models"].get("tokenizer", cfg["draft"]["name"])
-    tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    tokenizer.padding_side = "left"
+    # ------- Load finetuned draft (LoRA) + teacher using model_dir cfg
+    kd_model_dir = Path(cfg.grpo.base_model_dir).expanduser().resolve()
+    dtype = parse_torch_dtype(cfg_get(cfg, "training.dtype", "bf16"))
 
-    # Draft (LoRA or Unsloth path if you prefer; reuse from train_kd.py)
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["draft"]["name"], device_map="auto", torch_dtype=getattr(torch, cfg["training"]["dtype"])
+    try:
+        tokenizer, draft, teacher, train_cfg, stage_kind, used_cfg_path = \
+            load_models_for_eval_from_model_dir(
+                kd_model_dir, dtype_name=str(dtype).split(".")[-1], device_map="auto"
+            )
+    except Exception as e:
+        # Fallback: load tokenizer from kd cfg, load draft (LoRA) from dir + teacher by name in cfg.grpo.teacher
+        # (this path shouldn't trigger if your load.py already handles kd cfg gracefully)
+        print(f"[warn] primary model loader failed: {e}")
+        # minimal fallback path
+        from peft import PeftModel
+        raw_kd = load_yaml_with_includes(kd_model_dir / "cfg.lock.yaml")
+        kd_cfg = to_attrdict(raw_kd)
+        tokenizer = load_tokenizer_from_training_cfg(kd_cfg)
+        draft_base = AutoModelForCausalLM.from_pretrained(
+            kd_cfg.models.draft, torch_dtype=dtype, device_map="auto"
+        )
+        draft = PeftModel.from_pretrained(draft_base, kd_model_dir)
+        draft.config.use_cache = False
+        draft.train()
+        teacher_name = cfg_get(cfg, "grpo.teacher", cfg_get(kd_cfg, "models.target", None)) \
+                       or cfg_get(kd_cfg, "models.tokenizer", None)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            teacher_name, torch_dtype=dtype, device_map="auto"
+        )
+        teacher.config.use_cache = False
+        teacher.eval()
+        train_cfg, used_cfg_path = kd_cfg, kd_model_dir / "cfg.lock.yaml"
+        stage_kind = "kd"
+
+    # Report layers / LoRA injection
+    if bool(cfg_get(cfg, "grpo.print_layers", True)):
+        print_model_layer_report(draft,   title="GRPO draft (starting from KD)", limit=80, only_lora=True)
+        print_model_layer_report(teacher, title="GRPO teacher (reference)",      limit=40, only_lora=True)
+
+    # Optional reference for KL control: "teacher" | "draft_init" | "none"
+    kl_ref = str(cfg_get(cfg, "grpo.kl_ref", "teacher")).lower()
+    kl_coeff = float(cfg_get(cfg, "grpo.kl_coeff", 0.01))
+    ref_model = None
+    if kl_ref == "draft_init":
+        # make a frozen copy (weights shared if LoRA, so we load a new base and attach adapters snapshot)
+        from copy import deepcopy
+        ref_model = deepcopy(draft).eval()
+        for p in ref_model.parameters(): p.requires_grad_(False)
+    elif kl_ref == "teacher":
+        ref_model = teacher
+    else:
+        ref_model = None
+
+    # ------- Build prompt pool (HF split) -------
+    base_split = cfg.data.split
+    prompts = load_prompts_for_split(tokenizer, cfg, split=base_split)
+    if not prompts:
+        train_prompts, val_prompts = make_manual_splits(tokenizer, cfg, seed=int(cfg.training.seed))
+        prompts = train_prompts
+    # Subsample if needed
+    sample_max = cfg_get(cfg, "data.sample_max", None)
+    if sample_max:
+        prompts = prompts[: int(sample_max)]
+
+    # A tiny dataset that yields prompts; dataloader shuffles each epoch
+    ds = PromptDataset(prompts)
+    dl = DataLoader(
+        ds,
+        batch_size=int(cfg.grpo.batch_size),
+        shuffle=True,
+        num_workers=int(cfg_get(cfg, "grpo.num_workers", 2)),
+        pin_memory=True,
+        drop_last=True,
     )
-    peft = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=int(cfg["lora"]["r"]),
-        lora_alpha=int(cfg["lora"]["alpha"]),
-        lora_dropout=float(cfg["lora"]["dropout"]),
-        target_modules=list(cfg["lora"]["target_modules"]),
-        bias="none",
-    )
-    model = get_peft_model(model, peft)
-    if hasattr(model,"gradient_checkpointing_enable"):
-        try: model.gradient_checkpointing_enable()
-        except TypeError: model.gradient_checkpointing_enable(use_reentrant=False)
-    if hasattr(model,"config"): model.config.use_cache = False
-    model.train()
 
-    # vLLM teacher for verification (fast)
-    llm = LLM(
-        model=cfg["models"]["target"],
-        tensor_parallel_size=int(cfg["vllm"]["tensor_parallel_size"]),
-        dtype=cfg["vllm"]["dtype"],
-        gpu_memory_utilization=float(cfg["vllm"]["gpu_memory_utilization"]),
+    # ------- Optim & schedule (train only LoRA params) -------
+    optim = build_adamw(
+        draft,
+        lr=float(cfg.grpo.lr),
+        weight_decay=float(cfg.grpo.get("weight_decay", 0.0)),
+        betas=tuple(cfg.grpo.get("betas", [0.9, 0.95])),
+        eps=1e-8,
+    )
+    sched = make_warmup_cosine(
+        optim,
+        total_steps=int(cfg.grpo.total_steps),
+        warmup_ratio=float(cfg.grpo.get("warmup_ratio", 0.05)),
+        min_lr=float(cfg.grpo.get("min_lr", 0.0)),
     )
 
-    group_size = int(cfg["grpo"]["group_size"])
-    S = int(cfg["grpo"]["S"])
-    temperature = float(cfg["grpo"]["temperature"])
-    clip_eps = float(cfg["ppo"]["clip_eps"])
+    # ------- W&B -------
+    run = maybe_init_wandb(
+        enabled=bool(args.wandb),
+        api_key=args.wandb_api_key,
+        project=cfg_get(cfg, "logging.project", "grpo-train"),
+        name=cfg_get(cfg, "logging.name", "grpo_run"),
+        config=json.loads(json.dumps(cfg, default=str)),
+        tags=cfg_get(cfg, "logging.tags", None),
+        group=cfg_get(cfg, "logging.group", None),
+        mode=cfg_get(cfg, "logging.mode", None),
+    )
 
-    optim = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"]["lr"]), weight_decay=float(cfg["training"]["weight_decay"]))
-    steps = int(cfg["grpo"]["total_steps"])
+    # ------- Train loop -------
+    device = torch.device(cfg_get(cfg, "training.device", "cuda"))
+    max_new = int(cfg.grpo.max_new)
+    temperature = float(cfg.grpo.temperature)
+    cap = float(cfg.grpo.acceptance_cap)
+    group_size = int(cfg.grpo.group_size)
+    grad_clip = float(cfg.training.get("max_grad_norm", 1.0))
+    acc_steps = int(cfg.grpo.get("grad_accum_steps", 1))
+    print_every = int(cfg.grpo.log_every)
 
-    pbar = tqdm(range(steps), desc="GRPO", ncols=100)
+    draft.train()
+    pbar = tqdm(range(int(cfg.grpo.total_steps)), desc="GRPO", ncols=100)
+    it = iter(dl)
+
     for step in pbar:
-        # TODO: sample batch prompts from your dataset util (reuse HF loader from KD)
-        # For brevity, assume `batch_prompts: List[str]`
-        batch_prompts = ["Explain overfitting in simple terms."] * 2
+        try:
+            batch_prompts = [next(it) for _ in range(1)]
+            # DataLoader returns strings already
+            batch_prompts = batch_prompts[0]
+        except StopIteration:
+            it = iter(dl)
+            batch_prompts = next(it)
 
-        # Rollout draft S steps (sampled)
-        enc = tokenizer(batch_prompts, padding=True, truncation=True, max_length=cfg["data"]["max_input_len"], return_tensors="pt").to(device)
-        B = enc["input_ids"].shape[0]
-        cur_ids = enc["input_ids"]; cur_attn = enc["attention_mask"]
-        actions, old_logps, draft_logits_steps = [], [], []
-        for t in range(S):
-            out = model(input_ids=cur_ids, attention_mask=cur_attn, use_cache=False)
-            last = out.logits[:, -1, :]
-            if temperature <= 0.0:
-                act = last.argmax(dim=-1)
-            else:
-                probs = (last / max(temperature, 1e-6)).softmax(dim=-1)
-                act = torch.multinomial(probs, 1).squeeze(-1)
-            logp = last.log_softmax(dim=-1).gather(-1, act[:,None]).squeeze(-1)
-            actions.append(act); old_logps.append(logp)
-            draft_logits_steps.append(last)
-            cur_ids = torch.cat([cur_ids, act[:,None]], dim=1)
-            cur_attn = torch.cat([cur_attn, torch.ones(B,1, device=device, dtype=cur_attn.dtype)], dim=1)
-
-        # vLLM probe: teacher top-1 accept + top-K logprobs on generated tokens
-        # Ask vLLM to return logprobs for generated continuation tokens
-        sp = SamplingParams(max_tokens=0, logprobs=cfg["reward"]["topk_for_ce"], prompt_logprobs=True)
-        texts = [tokenizer.decode(ids) for ids in cur_ids]  # cheap re-decode
-        outs = llm.generate(texts, sp)
-
-        # Build acceptance mask from teacher top-1
-        accepted = torch.zeros(S, B, device=device)
-        topk_ids = torch.zeros(B, S, cfg["reward"]["topk_for_ce"], dtype=torch.int64, device=device)
-        topk_lps = torch.full_like(topk_ids, -1e30, dtype=torch.float32)
-
-        for b, o in enumerate(outs):
-            prompt_token_logprobs = o.prompt_logprobs  # per input token
-            # last S entries correspond to generated tokens
-            lastS = prompt_token_logprobs[-S:]
-            for t in range(S):
-                cand = lastS[t]
-                # find top-1 id
-                # normalize to list of (id, lp)
-                pairs = []
-                if isinstance(cand, dict):
-                    for tk, lp in cand.items():
-                        tid = tokenizer.convert_tokens_to_ids(tk)
-                        if tid is not None and tid >= 0: pairs.append((tid, float(lp)))
-                else:
-                    for c in cand:
-                        pairs.append((c.token_id, float(c.logprob)))
-                pairs.sort(key=lambda x: x[1], reverse=True)
-                # fill arrays
-                for k in range(min(len(pairs), topk_ids.shape[-1])):
-                    topk_ids[b, t, k] = pairs[k][0]
-                    topk_lps[b, t, k] = pairs[k][1]
-                # accept if teacher top-1 equals action
-                if len(pairs) > 0:
-                    accepted[t, b] = 1.0 if pairs[0][0] == int(actions[t][b].item()) else 0.0
-
-        first_rej = first_reject_mask(accepted)  # [T,B]
-        mask_TB = torch.clamp(accepted + first_rej, max=1.0)
-
-        # draft logits at each step as [T,B,V]
-        T = S
-        d_logits_TBV = torch.stack(draft_logits_steps, dim=0)  # [T,B,V]
-        # compute sparse KL on masked positions
-        loss_div = sparse_kd_kl(
-            d_logits_BT_V=d_logits_TBV.transpose(0,1).contiguous(),        # [B,T,V]
-            topk_ids_BTK=topk_ids.transpose(0,1).contiguous(),             # [T,B,K]→[B,T,K]
-            topk_logprobs_BTK=topk_lps.transpose(0,1).contiguous(),
-            mask_BT=mask_TB.transpose(0,1).contiguous(),                   # [B,T]
-            tail_mode="bucket",
-            distill_temp=1.0,
+        # Tokenize prompts (left-pad) with a safe budget (context)
+        # We’ll clip earlier in data_gen/eval the same way
+        prep_prompts = _prepare_prompts(
+            tokenizer, batch_prompts, max_input_len=int(cfg.data.max_input_len), S=max_new
+        )
+        prompt_ids, prompt_attn, pr_lens, pad_id = _tokenize_prompts(
+            tokenizer, prep_prompts, max_input_len=int(cfg.data.max_input_len)
         )
 
-        # PPO-style ratio clip on sampled actions
-        old_acts_logp = torch.stack(old_logps, dim=0)  # [T,B]
-        new_acts_logp = []
-        for t in range(S):
-            logits = draft_logits_steps[t]
-            act = actions[t]
-            new_acts_logp.append(logits.log_softmax(-1).gather(-1, act[:,None]).squeeze(-1))
-        new_acts_logp = torch.stack(new_acts_logp, dim=0)
-        adv = -loss_div.detach()  # cheap scalar baseline (you can replace with per-step adv if you like)
-        ratio = (new_acts_logp - old_acts_logp).exp()
-        clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-        # weight by mask
-        ppo_obj = -torch.min(ratio*adv, clipped*adv) * mask_TB
-        loss_ppo = ppo_obj.sum() / (mask_TB.sum().clamp_min(1.0))
+        # 1) Sample group completions (no grad)
+        eos_id = tokenizer.eos_token_id
+        with torch.no_grad():
+            seqs, rep_pr_lens = _sample_group(
+                draft.eval(), tokenizer, prompt_ids, prompt_attn,
+                group_size=group_size, max_new=max_new,
+                temperature=temperature, eos_id=eos_id
+            )
+        draft.train()  # back to train for gradient passes
 
-        total = loss_ppo + loss_div  # divergence + policy improvement
+        N, L = seqs.shape  # N = B * group_size
 
-        optim.zero_grad(set_to_none=True)
-        total.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["training"]["max_grad_norm"]))
-        optim.step()
+        # 2) Compute draft logprobs on sampled tokens WITH grad
+        #    One forward on the full sequences to pull the next-token logits
+        att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long().to(device)
+        out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+        d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
+            out.logits, seqs.to(device), rep_pr_lens, max_new=max_new
+        )  # [N,T],[N,T]
 
-        wandb.log({"train/grpo_total": float(total.detach().cpu()),
-                   "train/grpo_div": float(loss_div.detach().cpu()),
-                   "train/grpo_ppo": float(loss_ppo.detach().cpu()),
-                  }, step=step)
-        pbar.set_postfix(loss=f"{float(total.detach().cpu()):.3f}")
+        # 3) Teacher logprobs on same tokens (no grad)
+        with torch.no_grad():
+            tout = teacher(input_ids=seqs.to(teacher.device), attention_mask=att.to(teacher.device), use_cache=False)
+            t_logp_NT, _ = _gather_token_logps_from_forward(
+                tout.logits.to(d_logp_NT.device), seqs.to(d_logp_NT.device), rep_pr_lens, max_new=max_new
+            )
 
-    wandb.finish()
+        # 4) Optional ref logprobs for KL
+        if kl_ref == "teacher":
+            ref_logp_NT = t_logp_NT
+        elif kl_ref == "draft_init":
+            with torch.no_grad():
+                rout = ref_model(input_ids=seqs.to(ref_model.device), attention_mask=att.to(ref_model.device), use_cache=False)
+                ref_logp_NT, _ = _gather_token_logps_from_forward(
+                    rout.logits.to(d_logp_NT.device), seqs.to(d_logp_NT.device), rep_pr_lens, max_new=max_new
+                )
+        else:
+            ref_logp_NT = None
+
+        # 5) Rewards from expected acceptance / goodput
+        rewards = expected_alpha_and_goodput_from_logps(
+            draft_logp=d_logp_NT.detach(), teacher_logp=t_logp_NT, mask=gen_mask_NT, acceptance_cap=cap
+        )
+        # scalar per-sample reward used by GRPO
+        reward_key = str(cfg_get(cfg, "grpo.reward_key", "goodput")).lower()
+        if reward_key == "alpha":
+            r_N = rewards["alpha_mean"]
+        elif reward_key == "accepted_tokens":
+            r_N = rewards["accepted_tokens"]
+        else:
+            r_N = rewards["goodput"]
+
+        # 6) Group Relative baseline (mean within each prompt-group)
+        B = prompt_ids.size(0)
+        G = group_size
+        assert B * G == N, (B, G, N)
+        r_BG = r_N.view(B, G)
+        base_B = r_BG.mean(dim=1, keepdim=True)           # [B,1]
+        adv_BG = (r_BG - base_B)                           # [B,G]
+        adv_N = adv_BG.view(N)
+
+        # Policy loss = - E[adv * sum_t logpi_t / valid_t]
+        valid_t = gen_mask_NT.sum(dim=1).clamp_min(1.0)    # [N]
+        sum_logpi = (d_logp_NT * gen_mask_NT).sum(dim=1)   # [N]
+        pol_loss = -(adv_N.detach() * (sum_logpi / valid_t)).mean()
+
+        # KL control (optional)
+        if ref_logp_NT is not None and kl_coeff > 0:
+            kl_per_t = (d_logp_NT - ref_logp_NT) * gen_mask_NT  # E_{pi} log pi/ref
+            kl_term = kl_per_t.sum(dim=1) / valid_t
+            kl_loss = kl_coeff * kl_term.mean()
+        else:
+            kl_loss = torch.zeros((), device=d_logp_NT.device)
+
+        loss = pol_loss + kl_loss
+        (loss / acc_steps).backward()
+
+        if (step + 1) % acc_steps == 0:
+            torch.nn.utils.clip_grad_norm_(draft.parameters(), grad_clip)
+            optim.step()
+            sched.step()
+            optim.zero_grad(set_to_none=True)
+
+        # ---- logging
+        if step % print_every == 0:
+            logs = {
+                "grpo/loss": float(loss.detach().cpu()),
+                "grpo/policy_loss": float(pol_loss.detach().cpu()),
+                "grpo/kl_loss": float(kl_loss.detach().cpu()),
+                "grpo/lr": sched.get_last_lr()[0],
+                "grpo/alpha_mean": float(rewards["alpha_mean"].mean().detach().cpu()),
+                "grpo/goodput": float(rewards["goodput"].mean().detach().cpu()),
+                "grpo/reject_rate": float(rewards["reject_rate"].mean().detach().cpu()),
+                "grpo/mean_len": float(valid_t.mean().detach().cpu()),
+            }
+            wandb_log(logs, step=step)
+            pbar.set_postfix(loss=f"{logs['grpo/loss']:.3f}",
+                             gp=f"{logs['grpo/goodput']:.3f}",
+                             alpha=f"{logs['grpo/alpha_mean']:.3f}")
+
+    # ------- Save adapters + summary -------
+    outdir = out_dir / "lora"
+    outdir.mkdir(parents=True, exist_ok=True)
+    try:
+        draft.save_pretrained(str(outdir))
+    except Exception:
+        torch.save(draft.state_dict(), outdir / "pytorch_model.bin")
+
+    save_json(
+        {
+            "finished_at": timestamp(),
+            "steps": int(cfg.grpo.total_steps),
+            "base_model_dir": str(kd_model_dir),
+            "out_dir": str(outdir),
+            "kl_ref": kl_ref,
+            "reward_key": reward_key,
+        },
+        out_dir / "train_summary.json",
+    )
+    wandb_finish()
+    print(f"[DONE] GRPO LoRA saved at: {outdir}")
+
 
 if __name__ == "__main__":
     main()
