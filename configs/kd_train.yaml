@@ -25,8 +25,8 @@ data:
 
 models:
   # Draft must share tokenizer/vocab with teacher family used for data_gen
-  draft: Qwen/Qwen3-1.8B
-  tokenizer: Qwen/Qwen3-1.8B
+  draft: Qwen/Qwen3-0.6B
+  tokenizer: Qwen/Qwen3-8B
 
 lora:
   r: 16

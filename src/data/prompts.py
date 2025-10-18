@@ -77,19 +77,22 @@ def make_manual_splits(tokenizer, cfg, seed: int | None = None) -> Tuple[List[st
                 break
 
     ms = cfg.data.get("manual_splits", {})
-    n_train = int(ms.get("train", max(1, int(len(prompts) * 0.9))))
-    n_val   = int(ms.get("validation", len(prompts) - n_train))
+    n_kd_train = int(ms.get("kd_train", max(1, int(len(prompts) * 0.5))))
+    n_grpo_train = int(ms.get("grpo_train", max(1, int(len(prompts) * 0.4))))
+    n_val   = int(ms.get("validation", len(prompts) - n_kd_train - n_grpo_train))
 
     idx = list(range(len(prompts)))
     rnd = random.Random(seed or 1234)
     rnd.shuffle(idx)
 
-    train_idx = idx[: min(n_train, len(idx))]
-    val_idx   = idx[min(n_train, len(idx)) : min(n_train + n_val, len(idx))]
+    kd_train_idx = idx[: min(n_kd_train, len(idx))]
+    grpo_train_idx = idx[min(n_kd_train, len(idx)): min(n_kd_train + n_grpo_train, len(idx))]
+    val_idx   = idx[min(n_kd_train + n_grpo_train, len(idx)) : min(n_kd_train + n_grpo_train + n_val, len(idx))]
 
-    train_prompts = [prompts[i] for i in train_idx]
+    kd_train_prompts = [prompts[i] for i in kd_train_idx]
+    grpo_train_prompts = [prompts[i] for i in grpo_train_idx]
     val_prompts   = [prompts[i] for i in val_idx]
-    return train_prompts, val_prompts
+    return kd_train_prompts, grpo_train_prompts, val_prompts
 
 def truncate_prompt_by_tokens(tokenizer, prompt: str, max_tokens: int) -> str:
     """

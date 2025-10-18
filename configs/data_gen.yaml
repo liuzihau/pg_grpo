@@ -10,7 +10,8 @@ data:
   load_kwargs: {}
   sample_max: null             # cap how many HF records we read (null = all)
   manual_splits:               # used ONLY if your HF split is missing
-    train: 10000               # take N prompts into the train pool
+    kd_train: 8000               # take N prompts into the train pool
+    grpo_train: 4000               # take N prompts into the train pool
     validation: 1000           # take N prompts into the val pool
   # (Optional) de-duplication
   dedupe: true

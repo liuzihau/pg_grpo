@@ -4,7 +4,7 @@ data:
   hf_name: allenai/tulu-3-sft-mixture
   messages_field: messages
   keep_history: true
-  split: train
+  split: grpo
   max_input_len: 4096
   load_kwargs: {}
   sample_max: null
@@ -14,7 +14,7 @@ grpo:
   out_dir: outputs/grpo/qwen3_grpo
   use_pregen_prompts: true
   pregen_dir: data/kd_corpus/qwen8b_S64_topk20
-  pregen_split: train            # or validation
+  pregen_split: grpo              # or validation
   offset_strategy: stride        # "uniform" | "stride"
   offset_stride: 8               # 0, 8, 16, ... up to cont_len-1
   cushion: 8                  # reserved tokens (guard room)

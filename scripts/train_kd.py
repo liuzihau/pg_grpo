@@ -62,7 +62,7 @@ def main():
     # ---- Data ----
     # We re-tokenize prompt_text with *this* tokenizer to ensure vocab consistency.
     ds_root = Path(cfg.kd.pregen_dir)
-    ds = PreGeneratedTopKDataset(ds_root, split="train")
+    ds = PreGeneratedTopKDataset(ds_root, split="kd_train")
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
     def _collate(batch):

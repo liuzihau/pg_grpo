@@ -346,8 +346,6 @@ def main():
     # Freeze base & unfreeze only LoRA/adapter weights
     draft.train()
 
-
-
     # Report layers / LoRA injection
     if bool(cfg_get(cfg, "grpo.print_layers", True)):
         print_model_layer_report(draft,   title="GRPO draft (starting from KD)", limit=80, only_lora=True)

@@ -199,16 +199,10 @@ def main():
 
     # Build splits (HF or manual)
     # 1) Try to read target split directly; if empty, fall back to manual splits
-    base_split = cfg.data.split
-    train_prompts = load_prompts_for_split(tokenizer, cfg, split=base_split)
-    if not train_prompts:
-        print("[info] HF split empty or missing -> using manual_splits over the whole dataset")
-        train_prompts, val_prompts = make_manual_splits(tokenizer, cfg)
-    else:
-        # If validation split exists, try to load; otherwise manual sample from train pool
-        val_prompts = load_prompts_for_split(tokenizer, cfg, split="validation")
-        if not val_prompts and cfg_get(cfg, "data.manual_splits", None):
-            train_prompts, val_prompts = make_manual_splits(tokenizer, cfg, seed=int(cfg.training.seed))
+    # This handles both: (a) true HF splits or (b) "manual" re-split of a base split.
+    kd_train_prompts, grpo_train_prompts, val_prompts = make_manual_splits(
+        tokenizer, cfg, seed=int(cfg.training.seed)
+    )
 
     # Optional dedupe (exact string match)
     if bool(cfg_get(cfg, "data.dedupe", True)):
@@ -218,25 +212,62 @@ def main():
                 if s not in seen:
                     seen.add(s); out.append(s)
             return out
-        train_prompts = _dedupe(train_prompts)
+        kd_train_prompts = _dedupe(kd_train_prompts)
+        grpo_train_prompts = _dedupe(grpo_train_prompts)
         if val_prompts:
             val_prompts = _dedupe(val_prompts)
 
-    save_json({"train": len(train_prompts), "validation": len(val_prompts or [])},
-              out_dir / "split_sizes.json")
+    split_sizes = {
+        "kd_train": len(kd_train_prompts),
+        "grpo_train": len(grpo_train_prompts),
+        "validation": len(val_prompts or []),
+    }
+    save_json(split_sizes, out_dir / "split_sizes.json")
 
-    # Generate each split
-    manifests = {"created_at": timestamp(), "model": cfg.models.target, "root_out": str(out_dir)}
+    # ----- Generate each split -----
+    manifests = {
+        "created_at": timestamp(),
+        "model": cfg.models.target,
+        "root_out": str(out_dir),
+        "splits": split_sizes,
+    }
+
+    # KD data goes under split name "train" (keeps train_kd.py unchanged)
     manifests["train"] = _gen_one_split(
-        split_name="train", prompts=train_prompts, tokenizer=tokenizer, llm=llm, cfg=cfg, out_dir=out_dir, seed=int(cfg.training.seed)
+        split_name="train",
+        prompts=kd_train_prompts,
+        tokenizer=tokenizer,
+        llm=llm,
+        cfg=cfg,
+        out_dir=out_dir,
+        seed=int(cfg.training.seed)
     )
+
+    # GRPO prompt pool (with teacher top-K) goes under split name "grpo"
+    manifests["grpo"] = _gen_one_split(
+        split_name="grpo",
+        prompts=grpo_train_prompts,
+        tokenizer=tokenizer,
+        llm=llm,
+        cfg=cfg,
+        out_dir=out_dir,
+        seed=int(cfg.training.seed) + 1
+    )
+
+    # Optional validation (same format as KD)
     if val_prompts:
         manifests["validation"] = _gen_one_split(
-            split_name="validation", prompts=val_prompts, tokenizer=tokenizer, llm=llm, cfg=cfg, out_dir=out_dir, seed=int(cfg.training.seed) + 1
+            split_name="validation",
+            prompts=val_prompts,
+            tokenizer=tokenizer,
+            llm=llm,
+            cfg=cfg,
+            out_dir=out_dir,
+            seed=int(cfg.training.seed) + 2
         )
 
     save_json(manifests, out_dir / "manifest.json")
-    print(f"[DONE] Wrote KD corpus into: {out_dir}")
+    print(f"[DONE] Wrote KD/GRPO corpus into: {out_dir}")
 
 
 if __name__ == "__main__":

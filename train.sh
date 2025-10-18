@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export WANDB_API_KEY=
 set -Eeuo pipefail
 
 # Fail fast if the key isn't set in the shell
