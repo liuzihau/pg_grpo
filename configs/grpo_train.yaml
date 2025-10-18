@@ -17,7 +17,7 @@ grpo:
   pregen_split: train            # or validation
   offset_strategy: stride        # "uniform" | "stride"
   offset_stride: 8               # 0, 8, 16, ... up to cont_len-1
-  get_cushion: 8                 # reserved tokens (guard room)
+  cushion: 8                  # reserved tokens (guard room)
   batch_size: 8
   group_size: 4               # GRPO: samples per prompt
   total_steps: 2000
@@ -36,8 +36,9 @@ grpo:
   group_size: 4               # reduce if still tight on memory
   batch_size: 2               # reduce if still tight on memory
   max_new: 64                 # reduce max_new to trim sequence length
-
-
+  teacher_microbatch: 8
+  teacher_device: "auto"        # or "cpu"
+  teacher_8bit: false
   # regularization
   kl_ref: teacher             # teacher | draft_init | none
   kl_coeff: 0.01

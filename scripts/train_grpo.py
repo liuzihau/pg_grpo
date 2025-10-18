@@ -91,7 +91,7 @@ def _sample_group(
     rep_attn = prompt_attn.repeat_interleave(group_size, dim=0).contiguous()
 
     gen = model.generate(
-        inputs=rep_ids.to(model.device),
+        input_ids=rep_ids.to(model.device),
         attention_mask=rep_attn.to(model.device),
         do_sample=True,
         temperature=max(1e-6, float(temperature)),
@@ -151,8 +151,78 @@ def _gather_token_logps_from_forward(
 
     return out_logp, mask
 
-# ----------------------------------- main -------------------------------------
+# ---- drop-in helper (uses teacher with KV cache, tiny memory) ----
 
+@torch.no_grad()
+def teacher_logps_for_sampled_tokens_stepwise(
+    teacher,
+    seqs: torch.Tensor,          # [N, L_out] left-padded: prompt + generated
+    pr_lens: list[int],          # len N, #prompt tokens for each seq
+    pad_id: int,
+    max_new: int,
+    device: torch.device | str,
+    microbatch: int = 8,         # verify N sequences in small chunks
+):
+    """
+    Returns:
+      t_logp_NT: [N,T] log p_teacher(y_t) for the *sampled* tokens of each sequence
+      mask_NT:  [N,T] 1 where step is valid (<= generated length), else 0
+    Works by:
+      1) build teacher KV cache on the prompt once
+      2) then step through generated tokens with cache (predict next, gather logp of the sampled token)
+    """
+    N, L = seqs.shape
+    device = torch.device(device)
+    teacher = teacher.to(device).eval()
+
+    T = int(max_new)
+    t_logp = torch.zeros((N, T), dtype=torch.float32, device=device)
+    mask   = torch.zeros((N, T), dtype=torch.float32, device=device)
+
+    # process in small microbatches to save memory
+    for s in range(0, N, microbatch):
+        e = min(s + microbatch, N)
+        for i in range(s, e):
+            seq = seqs[i]
+            p   = int(pr_lens[i])                         # prompt length for this seq
+            # number of generated tokens present in `seq`
+            valid_len = int((seq != pad_id).sum().item()) - p
+            g = max(0, min(valid_len, T))
+            if g == 0:
+                continue
+
+            # 1) run teacher on the prompt to build past
+            prompt = seq[:p].unsqueeze(0).to(device)      # [1, p]
+            att_pr = (prompt != pad_id).long()
+            out_pr = teacher(input_ids=prompt,
+                             attention_mask=att_pr,
+                             use_cache=True)
+            past = out_pr.past_key_values
+
+            # 2) step through generated tokens (teacher-forcing)
+            # first next-token is predicted from the *last prompt token*
+            prev = seq[p-1].view(1,1).to(device)          # x_{p-1}
+            for t in range(g):
+                out_t = teacher(input_ids=prev,
+                                use_cache=True,
+                                past_key_values=past)
+                logits_last = out_t.logits[:, -1, :]      # [1, V]
+                tgt = seq[p+t].view(1).to(device)         # y_t
+                logp = F.log_softmax(logits_last, dim=-1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # [1]
+                t_logp[i, t] = logp
+                mask[i, t] = 1.0
+
+                # advance cache and prev token
+                past = out_t.past_key_values
+                prev = seq[p+t].view(1,1).to(device)
+
+    return t_logp, mask
+
+
+
+
+
+# ----------------------------------- main -------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -316,7 +386,7 @@ def main():
                 max_new_tokens=int(cfg.grpo.max_new),
                 offset_strategy=str(cfg_get(cfg, "grpo.offset_strategy", "uniform")),
                 offset_stride=int(cfg_get(cfg, "grpo.offset_stride", 8)),
-                cushion=int(cfg_get(cfg, "grpo.get_cushion", 8)),
+                cushion=int(cfg_get(cfg, "grpo.cushion", 8)),
                 seed=None,   # <— no step-based seed; workers seed themselves
             )
 
@@ -434,7 +504,8 @@ def main():
         # 2) Compute draft logprobs on sampled tokens WITH grad
         #    One forward on the full sequences to pull the next-token logits
         att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long().to(device)
-        out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
         d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
             out.logits, seqs.to(device), rep_pr_lens, max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
         )
@@ -443,13 +514,19 @@ def main():
             optim.zero_grad(set_to_none=True)
             continue
 
-        # 3) Teacher logprobs on same tokens (no grad)
-        with torch.no_grad():
-            tout = teacher(input_ids=seqs.to(teacher.device), attention_mask=att.to(teacher.device), use_cache=False)
-            t_logp_NT, _ = _gather_token_logps_from_forward(
-                tout.logits.to(d_logp_NT.device), seqs.to(d_logp_NT.device), rep_pr_lens, max_new=max_new,
-                pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
-            )
+        # 3) Teacher logprobs on the same sampled tokens (no grad, stepwise KV cache)
+        t_logp_NT, t_mask_NT = teacher_logps_for_sampled_tokens_stepwise(
+            teacher=teacher,
+            seqs=seqs.to(device),          # [N, L_out]
+            pr_lens=rep_pr_lens,           # list[int], same as you pass to draft gather
+            pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+            max_new=max_new,
+            device=device,
+            microbatch=int(cfg_get(cfg, "grpo.teacher_microbatch", 8)),
+        )
+        # Keep only the positions we actually filled (both masks are 1 where valid)
+        valid_mask = (gen_mask_NT > 0) & (t_mask_NT > 0)
+        
         # 4) Optional ref logprobs for KL
         if kl_ref == "teacher":
             ref_logp_NT = t_logp_NT
@@ -464,8 +541,21 @@ def main():
 
         # 5) Rewards from expected acceptance / goodput
         rewards = expected_alpha_and_goodput_from_logps(
-            draft_logp=d_logp_NT.detach(), teacher_logp=t_logp_NT, mask=gen_mask_NT, acceptance_cap=cap
+            draft_logp=d_logp_NT.detach(),
+            teacher_logp=t_logp_NT,
+            mask=valid_mask,
+            acceptance_cap=cap,
         )
+
+        # KL (if used)
+        if ref_logp_NT is not None and kl_coeff > 0:
+            kl_per_t = (d_logp_NT - ref_logp_NT) * valid_mask
+            kl_term = kl_per_t.sum(dim=1) / valid_t
+            kl_loss = kl_coeff * kl_term.mean()
+        else:
+            kl_loss = torch.zeros((), device=d_logp_NT.device)
+
+
         # scalar per-sample reward used by GRPO
         reward_key = str(cfg_get(cfg, "grpo.reward_key", "goodput")).lower()
         if reward_key == "alpha":
@@ -485,8 +575,8 @@ def main():
         adv_N = adv_BG.view(N)
 
         # Policy loss = - E[adv * sum_t logpi_t / valid_t]
-        valid_t = gen_mask_NT.sum(dim=1).clamp_min(1.0)    # [N]
-        sum_logpi = (d_logp_NT * gen_mask_NT).sum(dim=1)   # [N]
+        valid_t  = valid_mask.sum(dim=1).clamp_min(1.0)
+        sum_logpi = (d_logp_NT * valid_mask).sum(dim=1)
         pol_loss = -(adv_N.detach() * (sum_logpi / valid_t)).mean()
 
         # KL control (optional)
