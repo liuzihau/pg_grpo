@@ -25,6 +25,8 @@ from src.models.load import (
     print_model_layer_report,
 
 )
+from src.data.pregen_kd_ds import PreGeneratedTopKDataset   # reuse existing dataset
+from src.data.grpo_pregen import collate_grpo_prefixes
 from src.data.prompts import load_prompts_for_split, make_manual_splits, truncate_prompt_by_tokens
 from src.training.optim import build_adamw
 from src.training.schedule import make_warmup_cosine
@@ -74,7 +76,6 @@ def _tokenize_prompts(tokenizer, prompts: List[str], max_input_len: int):
 
 
 # ------------------------------ GRPO core utils -------------------------------
-
 @torch.no_grad()
 def _sample_group(
     model, tokenizer, prompt_ids: torch.Tensor, prompt_attn: torch.Tensor,
@@ -296,27 +297,63 @@ def main():
     else:
         ref_model = None
 
-    # ------- Build prompt pool (HF split) -------
-    base_split = cfg.data.split
-    prompts = load_prompts_for_split(tokenizer, cfg, split=base_split)
-    if not prompts:
-        train_prompts, val_prompts = make_manual_splits(tokenizer, cfg, seed=int(cfg.training.seed))
-        prompts = train_prompts
-    # Subsample if needed
-    sample_max = cfg_get(cfg, "data.sample_max", None)
-    if sample_max:
-        prompts = prompts[: int(sample_max)]
+    # ------- Build prompt source -------
+    use_pregen = bool(cfg_get(cfg, "grpo.use_pregen_prompts", False))
 
-    # A tiny dataset that yields prompts; dataloader shuffles each epoch
-    ds = PromptDataset(prompts)
-    dl = DataLoader(
-        ds,
-        batch_size=int(cfg.grpo.batch_size),
-        shuffle=True,
-        num_workers=int(cfg_get(cfg, "grpo.num_workers", 2)),
-        pin_memory=True,
-        drop_last=True,
-    )
+    if use_pregen:
+        # 2a) Use KD pre-generated corpus as prompt source with variable offsets
+        ds_root = Path(cfg.grpo.pregen_dir).expanduser().resolve()
+        pregen_split = str(cfg_get(cfg, "grpo.pregen_split", cfg.data.split))
+        ds = PreGeneratedTopKDataset(ds_root, split=pregen_split)
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        def _collate(batch):
+            return collate_grpo_prefixes(
+                batch=batch,
+                tokenizer=tokenizer,
+                pad_id=pad_id,
+                max_input_len=int(cfg.data.max_input_len),
+                max_new_tokens=int(cfg.grpo.max_new),
+                offset_strategy=str(cfg_get(cfg, "grpo.offset_strategy", "uniform")),
+                offset_stride=int(cfg_get(cfg, "grpo.offset_stride", 8)),
+                cushion=int(cfg_get(cfg, "grpo.get_cushion", 8)),
+                seed=int(cfg.training.seed) + step_seed_offset  # see below
+            )
+
+        num_workers = int(cfg_get(cfg, "grpo.num_workers", 2))
+        dl = DataLoader(
+            ds,
+            batch_size=int(cfg.grpo.batch_size),
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if num_workers > 0 else None,
+            drop_last=True,
+            collate_fn=_collate,
+        )
+        use_hf_text_prompts = False
+    else:
+        # 2b) Original: use HF split of raw text prompts
+        base_split = cfg.data.split
+        prompts = load_prompts_for_split(tokenizer, cfg, split=base_split)
+        if not prompts:
+            train_prompts, val_prompts = make_manual_splits(tokenizer, cfg, seed=int(cfg.training.seed))
+            prompts = train_prompts
+        sample_max = cfg_get(cfg, "data.sample_max", None)
+        if sample_max:
+            prompts = prompts[: int(sample_max)]
+        ds = PromptDataset(prompts)
+        dl = DataLoader(
+            ds,
+            batch_size=int(cfg.grpo.batch_size),
+            shuffle=True,
+            num_workers=int(cfg_get(cfg, "grpo.num_workers", 2)),
+            pin_memory=True,
+            drop_last=True,
+        )
+        use_hf_text_prompts = True
+
 
     # ------- Optim & schedule (train only LoRA params) -------
     optim = build_adamw(
@@ -359,7 +396,9 @@ def main():
     pbar = tqdm(range(int(cfg.grpo.total_steps)), desc="GRPO", ncols=100)
     it = iter(dl)
 
+    step_seed_offset = 0
     for step in pbar:
+        step_seed_offset = step  # makes collate choose different offsets across steps
         try:
             batch_prompts = [next(it) for _ in range(1)]
             # DataLoader returns strings already
@@ -370,12 +409,19 @@ def main():
 
         # Tokenize prompts (left-pad) with a safe budget (context)
         # We’ll clip earlier in data_gen/eval the same way
-        prep_prompts = _prepare_prompts(
-            tokenizer, batch_prompts, max_input_len=int(cfg.data.max_input_len), S=max_new
-        )
-        prompt_ids, prompt_attn, pr_lens, pad_id = _tokenize_prompts(
-            tokenizer, prep_prompts, max_input_len=int(cfg.data.max_input_len)
-        )
+        if use_hf_text_prompts:
+            prep_prompts = _prepare_prompts(
+                tokenizer, batch_prompts, max_input_len=int(cfg.data.max_input_len), S=max_new
+            )
+            prompt_ids, prompt_attn, pr_lens, pad_id = _tokenize_prompts(
+                tokenizer, prep_prompts, max_input_len=int(cfg.data.max_input_len)
+            )
+        else:
+            # batch_prompts here is a dict from collate_grpo_prefixes
+            prompt_ids = batch_prompts["prompt_ids"]      # [B, L]
+            prompt_attn = batch_prompts["prompt_attn"]    # [B, L]
+            pr_lens = batch_prompts["prompt_attn"].sum(dim=1).tolist()
+            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
         # 1) Sample group completions (no grad)
         eos_id = tokenizer.eos_token_id
