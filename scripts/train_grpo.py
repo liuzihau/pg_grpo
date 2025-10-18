@@ -317,7 +317,7 @@ def main():
                 offset_strategy=str(cfg_get(cfg, "grpo.offset_strategy", "uniform")),
                 offset_stride=int(cfg_get(cfg, "grpo.offset_stride", 8)),
                 cushion=int(cfg_get(cfg, "grpo.get_cushion", 8)),
-                seed=int(cfg.training.seed) + step_seed_offset  # see below
+                seed=None,   # <— no step-based seed; workers seed themselves
             )
 
         num_workers = int(cfg_get(cfg, "grpo.num_workers", 2))
@@ -396,13 +396,9 @@ def main():
     pbar = tqdm(range(int(cfg.grpo.total_steps)), desc="GRPO", ncols=100)
     it = iter(dl)
 
-    step_seed_offset = 0
     for step in pbar:
-        step_seed_offset = step  # makes collate choose different offsets across steps
         try:
-            batch_prompts = [next(it) for _ in range(1)]
-            # DataLoader returns strings already
-            batch_prompts = batch_prompts[0]
+            batch_prompts = next(it)
         except StopIteration:
             it = iter(dl)
             batch_prompts = next(it)
