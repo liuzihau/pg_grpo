@@ -547,14 +547,6 @@ def main():
             acceptance_cap=cap,
         )
 
-        # KL (if used)
-        if ref_logp_NT is not None and kl_coeff > 0:
-            kl_per_t = (d_logp_NT - ref_logp_NT) * valid_mask
-            kl_term = kl_per_t.sum(dim=1) / valid_t
-            kl_loss = kl_coeff * kl_term.mean()
-        else:
-            kl_loss = torch.zeros((), device=d_logp_NT.device)
-
 
         # scalar per-sample reward used by GRPO
         reward_key = str(cfg_get(cfg, "grpo.reward_key", "goodput")).lower()
