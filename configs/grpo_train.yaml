@@ -18,8 +18,8 @@ grpo:
   offset_strategy: stride        # "uniform" | "stride"
   offset_stride: 8               # 0, 8, 16, ... up to cont_len-1
   cushion: 8                  # reserved tokens (guard room)
-  batch_size: 8
-  group_size: 4               # GRPO: samples per prompt
+  batch_size: 2
+  group_size: 8               # GRPO: samples per prompt
   total_steps: 2000
   lr: 5.0e-5
   weight_decay: 0.0
@@ -30,12 +30,9 @@ grpo:
   temperature: 1.5  # 0.8
   acceptance_cap: 1.0
   grad_accum_steps: 1
-  log_every: 20
+  log_every: 5
   teacher_device: cpu         # "auto" (default GPU) or "cpu" to fully offload teacher
   teacher_8bit: false         # set true if you have bitsandbytes and want GPU 8-bit teacher
-  group_size: 4               # reduce if still tight on memory
-  batch_size: 2               # reduce if still tight on memory
-  max_new: 64                 # reduce max_new to trim sequence length
   teacher_microbatch: 8
   teacher_device: "auto"        # or "cpu"
   teacher_8bit: false
