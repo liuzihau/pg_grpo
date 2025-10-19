@@ -522,8 +522,6 @@ def main():
             device=device,
             microbatch=int(cfg_get(cfg, "grpo.teacher_microbatch", 8)),
         )
-        # Keep only the positions we actually filled (both masks are 1 where valid)
-        valid_mask = (gen_mask_NT > 0) & (t_mask_NT > 0)
         
         # 4) Optional ref logprobs for KL
         if kl_ref == "teacher":
@@ -538,13 +536,13 @@ def main():
             ref_logp_NT = None
 
         # 5) Rewards from expected acceptance / goodput
+        valid_mask = ((gen_mask_NT > 0) & (t_mask_NT > 0)).to(d_logp_NT.dtype)
         rewards = expected_alpha_and_goodput_from_logps(
             draft_logp=d_logp_NT.detach(),
             teacher_logp=t_logp_NT,
             mask=valid_mask,
             acceptance_cap=cap,
         )
-
 
         # scalar per-sample reward used by GRPO
         reward_key = str(cfg_get(cfg, "grpo.reward_key", "goodput")).lower()

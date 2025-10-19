@@ -11,40 +11,57 @@ __all__ = [
 
 def expected_alpha_and_goodput_from_logps(
     *,
-    draft_logp: torch.Tensor,     # [N,T] log q(y_t) on the *sampled tokens*
+    draft_logp: torch.Tensor,     # [N,T] log q(y_t) on the sampled tokens
     teacher_logp: torch.Tensor,   # [N,T] log p(y_t) on the same tokens
-    mask: Optional[torch.Tensor] = None,  # [N,T] 1=valid
+    mask: Optional[torch.Tensor] = None,  # [N,T] 1=valid, 0=pad/invalid
     acceptance_cap: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """
-    Token-wise acceptance on the actually sampled tokens:
+    SD-consistent stats.
       alpha_t(y_t) = min(1, p(y_t) / (cap * q(y_t))).
-    Inputs are log-probs for the *sampled tokens only* (shape [N,T]).
+    'accepted_tokens' is the expected accepted span:
+        E[L] = sum_t prod_{j<=t} alpha_j
     """
     assert draft_logp.shape == teacher_logp.shape, (draft_logp.shape, teacher_logp.shape)
-    N, T = draft_logp.shape
     device = draft_logp.device
-    if mask is None:
-        mask = torch.ones_like(draft_logp, device=device)
+    N, T = draft_logp.shape
 
-    # NOTE: ratio uses p/q (not q/p)
+    if mask is None:
+        mask = torch.ones_like(draft_logp, device=device, dtype=draft_logp.dtype)
+    else:
+        mask = (mask > 0).to(device=device, dtype=draft_logp.dtype)  # force {0,1} float
+
+    # per-token acceptance on sampled tokens
     log_cap = float(torch.log(torch.tensor(acceptance_cap, device=device, dtype=draft_logp.dtype)))
     log_ratio = teacher_logp - draft_logp - log_cap
-    alpha = torch.exp(log_ratio).clamp(max=1.0) * mask  # [N,T]
+    alpha_token = torch.exp(log_ratio).clamp(max=1.0)                # [N,T]
 
-    accepted = alpha.sum(dim=1)                 # [N]
-    valid = mask.sum(dim=1).clamp_min(1.0)      # [N]
-    rejects = (valid - accepted)
+    # --- strictly exclude padded steps from any tokenwise aggregates
+    alpha_masked = alpha_token * mask                                # [N,T]
 
-    alpha_mean = accepted / valid
-    reject_rate = 1.0 - alpha_mean
-    goodput = accepted / (1.0 + rejects).clamp_min(1e-6)
+    # tokenwise averages (diagnostic)
+    valid = mask.sum(dim=1).clamp_min(1.0)                           # [N]
+    alpha_sum = alpha_masked.sum(dim=1)                               # [N]
+    alpha_mean = alpha_sum / valid                                    # [N]
+
+    # SD expected span: sum_t prod_{j<=t} alpha_j
+    # For padded steps, we set alpha=1 so they don't truncate the product.
+    alpha_eff = torch.where(mask > 0, alpha_token, torch.ones_like(alpha_token))
+    cp = torch.cumprod(alpha_eff.clamp_min(1e-6), dim=1)             # [N,T]
+    expected_span = (cp * mask).sum(dim=1)                            # [N]
+
+    rejects = (valid - expected_span)
+    goodput = expected_span / (1.0 + rejects).clamp_min(1e-6)
+    reject_rate = 1.0 - (expected_span / valid)
+
     return {
-        "alpha_mean": alpha_mean,
-        "goodput": goodput,
-        "reject_rate": reject_rate,
-        "accepted_tokens": accepted,
-        "valid_tokens": valid,
+        "alpha_token": alpha_token,        # [N,T] (raw per-step alpha)
+        "alpha_mean": alpha_mean,          # [N]   mean alpha over valid steps only
+        "accepted_tokens": expected_span,  # [N]   expected accepted span (use this)
+        "valid_tokens": valid,             # [N]
+        "goodput": goodput,                # [N]
+        "reject_rate": reject_rate,        # [N]
+        "alpha_sum": alpha_sum,            # [N]   optional diagnostic
     }
 
 
