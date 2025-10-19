@@ -50,18 +50,18 @@ def expected_alpha_and_goodput_from_logps(
     cp = torch.cumprod(alpha_eff.clamp_min(1e-6), dim=1)             # [N,T]
     expected_span = (cp * mask).sum(dim=1)                            # [N]
 
-    rejects = (valid - expected_span)
-    goodput = expected_span / (1.0 + rejects).clamp_min(1e-6)
-    reject_rate = 1.0 - (expected_span / valid)
+    # rejects = (valid - expected_span)
+    # goodput = expected_span / (1.0 + rejects).clamp_min(1e-6)
+    # reject_rate = 1.0 - (expected_span / valid)
 
     return {
         "alpha_token": alpha_token,        # [N,T] (raw per-step alpha)
         "alpha_mean": alpha_mean,          # [N]   mean alpha over valid steps only
         "accepted_tokens": expected_span,  # [N]   expected accepted span (use this)
         "valid_tokens": valid,             # [N]
-        "goodput": goodput,                # [N]
-        "reject_rate": reject_rate,        # [N]
-        "alpha_sum": alpha_sum,            # [N]   optional diagnostic
+        # "goodput": goodput,                # [N]
+        # "reject_rate": reject_rate,        # [N]
+        # "alpha_sum": alpha_sum,            # [N]   optional diagnostic
     }
 
 

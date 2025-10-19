@@ -545,13 +545,13 @@ def main():
         )
 
         # scalar per-sample reward used by GRPO
-        reward_key = str(cfg_get(cfg, "grpo.reward_key", "goodput")).lower()
+        reward_key = str(cfg_get(cfg, "grpo.reward_key", "alpha_mean")).lower()
         if reward_key == "alpha":
             r_N = rewards["alpha_mean"]
         elif reward_key == "accepted_tokens":
             r_N = rewards["accepted_tokens"]
         else:
-            r_N = rewards["goodput"]
+            raise NotImplementedError()
 
         # 6) Group Relative baseline (mean within each prompt-group)
         B = prompt_ids.size(0)
@@ -561,6 +561,11 @@ def main():
         base_B = r_BG.mean(dim=1, keepdim=True)           # [B,1]
         adv_BG = (r_BG - base_B)                           # [B,G]
         adv_N = adv_BG.view(N)
+
+        adv_mean = adv_N.mean()
+        adv_std  = adv_N.std().clamp_min(1e-3)
+        adv_N = (adv_N - adv_mean) / adv_std
+        adv_N = adv_N.clamp(-5.0, 5.0)          # optional, prevents extreme updates
 
         # Policy loss = - E[adv * sum_t logpi_t / valid_t]
         valid_t  = valid_mask.sum(dim=1).clamp_min(1.0)
@@ -592,13 +597,13 @@ def main():
                 "grpo/kl_loss": float(kl_loss.detach().cpu()),
                 "grpo/lr": sched.get_last_lr()[0],
                 "grpo/alpha_mean": float(rewards["alpha_mean"].mean().detach().cpu()),
-                "grpo/goodput": float(rewards["goodput"].mean().detach().cpu()),
-                "grpo/reject_rate": float(rewards["reject_rate"].mean().detach().cpu()),
+                "grpo/accepted_tokens": float(rewards["accepted_tokens"].mean().detach().cpu()),
+                # "grpo/reject_rate": float(rewards["reject_rate"].mean().detach().cpu()),
                 "grpo/mean_len": float(valid_t.mean().detach().cpu()),
             }
             wandb_log(logs, step=step)
             pbar.set_postfix(loss=f"{logs['grpo/loss']:.3f}",
-                             gp=f"{logs['grpo/goodput']:.3f}",
+                             ats=f"{logs['grpo/accepted_tokens']:.3f}",
                              alpha=f"{logs['grpo/alpha_mean']:.3f}")
 
     # ------- Save adapters + summary -------
