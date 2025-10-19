@@ -52,13 +52,23 @@ def _build_sampling_params(cfg, S: int, K: int, seed: int) -> SamplingParams:
     )
 
 
-def _prepare_prompts(tokenizer, prompts: List[str], max_input_len: int, S: int) -> List[str]:
-    """Ensure decoder prompt length <= max_model_len - S via left truncation."""
+def _prepare_prompts(tokenizer, prompts: List[str],
+                     max_input_len: int, S: int,
+                     model_max_len: int | None = None,
+                     cushion: int = 8) -> List[str]:
+    """
+    Left-truncate so that: prompt_len <= min(max_input_len, model_max_len) - S - cushion
+    """
+    cap = int(max_input_len)
+    if model_max_len is not None:
+        cap = min(cap, int(model_max_len))
+    budget = max(1, cap - int(S) - int(cushion))
+
     out: List[str] = []
-    budget = max(1, max_input_len - 1)  # conservative cushion
     for p in prompts:
         out.append(truncate_prompt_by_tokens(tokenizer, p, budget))
     return out
+
 
 
 def _gen_one_split(
@@ -74,12 +84,14 @@ def _gen_one_split(
     S = int(cfg.gen.S)
     K_req = int(cfg.gen.K)
     K = _clamp_k_for_vllm(K_req)
-    if K != K_req:
-        print(f"[warn] gen.K={K_req} > 20, clamped to {K} for vLLM 0.11")
 
-    # Truncate prompts to fit (max_model_len == data.max_input_len here)
     prepped = _prepare_prompts(
-        tokenizer, prompts, max_input_len=int(cfg.data.max_input_len), S=S
+        tokenizer,
+        prompts,
+        max_input_len=int(cfg.data.max_input_len),
+        S=S,
+        model_max_len=int(getattr(cfg.vllm, "max_model_len", 10**9)),
+        cushion=8,
     )
 
     bs = int(cfg.gen.batch_size)
