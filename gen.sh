@@ -1,3 +1,3 @@
 #!/bin/bash
 
-python -m scripts.pregen_kd_vllm --config configs/defaults.yaml
+python -m scripts.data_gen --config configs/data_gen.yaml
