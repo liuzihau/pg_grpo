@@ -46,3 +46,9 @@ training:
 logging:
   project: kd-qwen
   name: qwen3_1_8b_kd_from_qwen3_8b_topk20
+
+eval_every: 100         # run quick eval every N steps (0 => disable)
+eval_split: validation  # must match split in your pregen folder
+eval_max_batches: 50    # cap batches during eval for speed (null => full)
+eval_batch_size: 8      # optional (defaults to kd.batch_size)
+eval_num_workers: 2     # optional (defaults to ~half of train workers)

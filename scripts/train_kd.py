@@ -25,6 +25,69 @@ from src.training.schedule import make_warmup_cosine
 from src.training.move import move_to_device_non_blocking
 
 
+@torch.no_grad()
+def _run_eval(
+    model,
+    dl,
+    *,
+    kd_temp: float,
+    tail_mode: str,
+    cfg,
+    device: torch.device,
+    max_batches: int | None = None,
+):
+    """Quick eval pass (same loss as training, no grad)."""
+    model.eval()
+
+    losses = []
+    cont_lens = []
+
+    for i, batch in enumerate(dl):
+        if max_batches is not None and i >= int(max_batches):
+            break
+
+        batch = move_to_device_non_blocking(batch, device)
+
+        out = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            use_cache=False,
+        )
+        logits = out.logits  # [B, L, V]
+
+        S = int(batch["cont_mask"].shape[1])
+        d_logits_BT_V = logits[:, -S:, :]  # [B, S, V]
+
+        # same weights & knobs as training
+        weights = build_kd_weights(
+            d_logits_BT_V=d_logits_BT_V,
+            topk_ids_BTK=batch["topk_ids"],
+            topk_logprobs_BTK=batch["topk_logprobs"],
+            cont_mask_BT=batch["cont_mask"].float(),
+            margin_gamma=float(cfg.kd.get("margin_gamma", 0.5)),
+            margin_center=float(cfg.kd.get("margin_center", 1.0)),
+            w_min=float(cfg.kd.get("w_min", 0.2)),
+            mismatch_lambda=float(cfg.kd.get("mismatch_lambda", 0.3)),
+        )
+
+        loss = sparse_kd_kl(
+            d_logits_BT_V=d_logits_BT_V,
+            topk_ids_BTK=batch["topk_ids"],
+            topk_logprobs_BTK=batch["topk_logprobs"],
+            mask_BT=weights,
+            distill_temp=kd_temp,
+            tail_mode=tail_mode,  # "bucket" or "ignore"
+        )
+
+        losses.append(float(loss.detach().cpu()))
+        cont_lens.append(float(batch["cont_len"].float().mean().cpu()))
+
+    mean_loss = sum(losses) / max(1, len(losses))
+    mean_cont_len = sum(cont_lens) / max(1, len(cont_lens))
+    model.train()  # back to train mode before returning
+    return mean_loss, mean_cont_len
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -86,6 +149,41 @@ def main():
         collate_fn=_collate,
         drop_last=True,
     )
+
+    # ---- Validation data loader (optional quick eval) ----
+    eval_every = int(cfg.kd.get("eval_every", 0))  # 0 => disabled
+    eval_split = str(cfg.kd.get("eval_split", "validation"))
+    eval_batches_cap = cfg.kd.get("eval_max_batches", 50)  # cap for speed, None => full set
+
+    val_dl = None
+    if eval_every > 0:
+        try:
+            ds_val = PreGeneratedTopKDataset(ds_root, split=eval_split)
+            if len(ds_val) == 0:
+                print(f"[eval] No records in split='{eval_split}' under {ds_root}; eval disabled.")
+            else:
+                def _collate_val(batch):
+                    return collate_topk(
+                        batch=batch,
+                        tokenizer=tokenizer,
+                        pad_id=pad_id,
+                        max_input_len=int(cfg.data.max_input_len),
+                    )
+
+                val_dl = DataLoader(
+                    ds_val,
+                    batch_size=int(cfg.kd.get("eval_batch_size", cfg.kd.batch_size)),
+                    shuffle=False,
+                    num_workers=int(cfg_get(cfg, "kd.eval_num_workers", max(1, num_workers // 2))),
+                    pin_memory=True,
+                    collate_fn=_collate_val,
+                    drop_last=False,
+                )
+                print(f"[eval] Enabled quick eval every {eval_every} steps on split='{eval_split}' "
+                      f"({len(ds_val)} samples, cap={eval_batches_cap}).")
+        except Exception as e:
+            print(f"[eval] Could not construct validation loader: {e}")
+            val_dl = None
 
     # ---- Optim & schedule ----
     total_steps = int(cfg.kd.total_steps)
@@ -194,6 +292,30 @@ def main():
             wandb_log(logs, step=step)
             pbar.set_postfix(loss=f"{logs['train/loss']:.3f}",
                              lr=f"{logs['train/lr']:.2e}")
+
+
+        if val_dl is not None and eval_every > 0 and (step + 1) % eval_every == 0:
+            val_loss, val_avg_len = _run_eval(
+                model, val_dl,
+                kd_temp=kd_temp,
+                tail_mode=tail_mode,
+                cfg=cfg,
+                device=device,
+                max_batches=eval_batches_cap,
+            )
+            wandb_log({
+                "eval/loss": float(val_loss),
+                "eval/avg_cont_len": float(val_avg_len),
+                "eval/step": step + 1,
+            }, step=step + 1)
+            # keep tqdm readable
+            pbar.set_postfix(
+                loss=f"{logs['train/loss']:.3f}",
+                lr=f"{logs['train/lr']:.2e}",
+                val_loss=f"{val_loss:.3f}"
+            )
+
+
 
     # ---- Save adapters + training summary ----
     outdir = out_dir / "lora"
