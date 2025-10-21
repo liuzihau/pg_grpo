@@ -230,6 +230,7 @@ def main():
     kd_temp = float(cfg.kd.get("distill_temp", 1.0))
     tail_mode = str(cfg.kd.get("topk_tail", "bucket"))
 
+    bst_val_loss =None
     it = iter(dl)
     pbar = tqdm(range(total_steps), desc="KD (top-K)", ncols=100)
     for step in pbar:
@@ -314,7 +315,29 @@ def main():
                 lr=f"{logs['train/lr']:.2e}",
                 val_loss=f"{val_loss:.3f}"
             )
+            if bst_val_loss is None:
+                bst_val_loss = val_loss
+            else:
+                if val_loss < bst_val_loss:
+                    bst_val_loss = val_loss
+                    # ---- Save best adapters + training summary ----
+                    outdir = f"{out_dir}-best" / "lora"
+                    outdir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        model.save_pretrained(str(outdir))
+                    except Exception:
+                        torch.save(model.state_dict(), outdir / "pytorch_model.bin")
 
+                    save_json(
+                        {
+                            "finished_at": timestamp(),
+                            "steps": total_steps,
+                            "model": cfg.models.draft,
+                            "pregen_dir": str(ds_root),
+                            "out_dir": str(outdir),
+                        },
+                        out_dir / "train_summary.json",
+                    )
 
 
     # ---- Save adapters + training summary ----
