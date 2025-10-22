@@ -31,6 +31,10 @@ def expected_alpha_and_goodput_from_logps(
     else:
         mask = (mask > 0).to(device=device, dtype=draft_logp.dtype)  # force {0,1} float
 
+    draft_logp = draft_logp.float()
+    teacher_logp = teacher_logp.float()
+    mask = torch.ones_like(draft_logp) if mask is None else (mask > 0).to(draft_logp.dtype)
+
     # per-token acceptance on sampled tokens
     log_cap = float(torch.log(torch.tensor(acceptance_cap, device=device, dtype=draft_logp.dtype)))
     log_ratio = teacher_logp - draft_logp - log_cap

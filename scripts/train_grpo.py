@@ -113,38 +113,32 @@ def _sample_group(
 def _gather_token_logps_from_forward(
     logits: torch.Tensor,    # [N, L, V]
     seqs: torch.Tensor,      # [N, L]
-    pr_lens: List[int],      # len N, prompt token counts
+    pr_lens: List[int],      # len N
     max_new: int,
     pad_id: int,
+    logprob_temp: float = 1.0,              # <--- NEW
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Extract log-probs for the generated tokens y_{1:T} given the model's logits.
-    We use the teacher-forcing alignment: logits at pos (p-1+t) predict token at (p+t).
-    Returns (logp [N,T], mask [N,T]).
-    """
     N, L, V = logits.shape
     device = logits.device
-    T = int(max_new)
+    T = float(max(1e-6, logprob_temp))
 
-    # log softmax once
-    logp_full = F.log_softmax(logits, dim=-1)  # [N,L,V]
+    # compute in float32 for numerical stability, with the SAME temperature used to sample
+    logp_full = F.log_softmax((logits.float() / T), dim=-1)  # [N,L,V] fp32
 
-    out_logp = torch.zeros((N, T), dtype=logits.dtype, device=device)
-    mask = torch.zeros((N, T), dtype=logits.dtype, device=device)
+    out_logp = torch.zeros((N, int(max_new)), dtype=logp_full.dtype, device=device)
+    mask = torch.zeros((N, int(max_new)), dtype=logp_full.dtype, device=device)
 
-    # true sequence lengths from padding
-    att = (seqs != pad_id).long()             # [N,L]
-    seq_lens = att.sum(dim=1)                 # [N]
-    pr_lens_t = torch.tensor(pr_lens, device=device, dtype=torch.long)  # [N]
-    gen_lens = (seq_lens - pr_lens_t).clamp(min=0, max=T)               # [N]
+    att = (seqs != pad_id).long()
+    seq_lens = att.sum(dim=1)
+    pr_lens_t = torch.tensor(pr_lens, device=device, dtype=torch.long)
+    gen_lens = (seq_lens - pr_lens_t).clamp(min=0, max=int(max_new))
 
     for i in range(N):
         g = int(gen_lens[i])
-        if g <= 0:
-            continue
+        if g <= 0: continue
         p = int(pr_lens[i])
         pos = torch.arange(g, device=device)
-        logits_idx = p - 1 + pos              # predicts token at p+pos
+        logits_idx = p - 1 + pos
         tgt_ids = seqs[i, p + pos]
         out_logp[i, :g] = logp_full[i, logits_idx, tgt_ids]
         mask[i, :g] = 1.0
@@ -152,7 +146,6 @@ def _gather_token_logps_from_forward(
     return out_logp, mask
 
 # ---- drop-in helper (uses teacher with KV cache, tiny memory) ----
-
 @torch.no_grad()
 def teacher_logps_for_sampled_tokens_stepwise(
     teacher,
@@ -208,7 +201,7 @@ def teacher_logps_for_sampled_tokens_stepwise(
                                 past_key_values=past)
                 logits_last = out_t.logits[:, -1, :]      # [1, V]
                 tgt = seq[p+t].view(1).to(device)         # y_t
-                logp = F.log_softmax(logits_last, dim=-1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # [1]
+                logp = F.log_softmax(logits_last.float(), dim=-1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
                 t_logp[i, t] = logp
                 mask[i, t] = 1.0
 
@@ -341,8 +334,9 @@ def _run_validation_once(
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
         d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
-            out.logits, seqs.to(device), rep_pr_lens, max_new=max_new,
-            pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
+            out.logits, seqs.to(device), rep_pr_lens,
+            max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+            logprob_temp=temperature,                  # use grpo.valid_temperature or train temp
         )
         if gen_mask_NT.sum().item() == 0:
             continue
@@ -689,7 +683,9 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
         d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
-            out.logits, seqs.to(device), rep_pr_lens, max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
+            out.logits, seqs.to(device), rep_pr_lens,
+            max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+            logprob_temp=temperature,                      # <--- IMPORTANT
         )
         if gen_mask_NT.sum().item() == 0:
             # nothing generated (should be rare); skip to next batch
@@ -714,7 +710,7 @@ def main():
             with torch.no_grad():
                 rout = ref_model(input_ids=seqs.to(ref_model.device), attention_mask=att.to(ref_model.device), use_cache=False)
                 ref_logp_NT, _ = _gather_token_logps_from_forward(
-                    rout.logits.to(d_logp_NT.device), seqs.to(d_logp_NT.device), rep_pr_lens, max_new=max_new
+                    rout.logits.to(d_logp_NT.device), seqs.to(d_logp_NT.device), rep_pr_lens, max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
                 )
         else:
             ref_logp_NT = None
