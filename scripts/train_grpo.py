@@ -74,7 +74,13 @@ def _tokenize_prompts(tokenizer, prompts: List[str], max_input_len: int):
     input_ids, attn, lens = _left_pad_batch(ids_list, pad_id=pad_id)
     return input_ids, attn, lens, pad_id
 
-
+def _hard_refresh_ref_model_(ref_model, draft):
+    """Overwrite ref_model weights with the current draft (no grads on ref)."""
+    ref_model.load_state_dict(draft.state_dict(), strict=False)
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad_(False)
+    return ref_model
 # ------------------------------ GRPO core utils -------------------------------
 @torch.no_grad()
 def _sample_group(
@@ -536,6 +542,7 @@ def main():
     else:
         ref_model = None
 
+    kl_ref_update_every = int(cfg_get(cfg, "grpo.kl_ref_update_every", 0))
     # ------- Build prompt source -------
     use_pregen = bool(cfg_get(cfg, "grpo.use_pregen_prompts", False))
 
@@ -808,7 +815,7 @@ def main():
             )
             draft.train()
 
-        if step % 2000 == 0:
+        if (step + 1) % acc_steps == 0:
             # ------- Save adapters + summary -------
             outdir = out_dir.with_name(out_dir.name + f"-step-{step}") / "lora"
             outdir.mkdir(parents=True, exist_ok=True)
@@ -817,6 +824,14 @@ def main():
             except Exception:
                 torch.save(draft.state_dict(), outdir / "pytorch_model.bin")
 
+            torch.nn.utils.clip_grad_norm_(draft.parameters(), grad_clip)
+            optim.step()
+            sched.step()
+            optim.zero_grad(set_to_none=True)
+
+    # ---- periodic ref_model refresh (for kl_ref == "draft_init")
+    if kl_ref == "draft_init" and kl_ref_update_every > 0 and ((step + 1) % kl_ref_update_every == 0):
+        _hard_refresh_ref_model_(ref_model, draft)
 
     # ------- Save adapters + summary -------
     outdir = out_dir / "lora"

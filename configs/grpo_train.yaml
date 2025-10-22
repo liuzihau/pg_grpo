@@ -35,7 +35,7 @@ grpo:
   # train related
   reward_key: accepted_tokens
   batch_size: 1
-  group_size: 12               # GRPO: samples per prompt
+  group_size: 8               # GRPO: samples per prompt
   total_steps: 10000
   lr: 5.0e-5
   weight_decay: 0.0
@@ -50,10 +50,12 @@ grpo:
   teacher_device: cpu         # "auto" (default GPU) or "cpu" to fully offload teacher
   teacher_8bit: false         # set true if you have bitsandbytes and want GPU 8-bit teacher
   teacher_microbatch: 8
-  teacher_device: "auto"        # or "cpu"
+  teacher_device: "auto"      # or "cpu"
   teacher_8bit: false
   # regularization
-  kl_ref: draft_init             # teacher | draft_init | none
+  kl_ref: draft_init          # teacher | draft_init | none
+  kl_ref_update_every: 1000   # <-- H steps; 0 disables refresh
+
   kl_coeff: 0.1
   print_layers: true
 
