@@ -1,31 +1,39 @@
-# configs/eval.yaml
-# Only dataset + eval knobs; models are read from the training cfg stored in eval.model_dir
+# configs/eval_sd.yaml
+
+models:
+  # Any of these can be null. If a LoRA adapter path is given, we’ll try to
+  # read base_model from the adapter_config; if missing, we fall back to base_model below.
+  base_model: Qwen/Qwen3-0.6B              # (optional) evaluate raw base
+  kd_model: outputs/kd/qwen3_draft_lora/lora    # (optional) LoRA adapter folder or full HF id
+  grpo_model: outputs/grpo/qwen3_grpo/lora      # (optional) LoRA adapter folder or full HF id
+  teacher_model: Qwen/Qwen3-8B              # REQUIRED for SD
+  tokenizer: null                           # optional; defaults to teacher_model
+
 data:
-  source: hf
-  hf_name: allenai/tulu-3-sft-mixture
-  messages_field: messages
-  keep_history: true
-  split: validation
-  max_input_len: 4096
-  load_kwargs: {}
-  sample_max: null
+  use_pregen: true                           # true => read prompts from pregen folder
+  pregen_folder: data/kd_corpus/qwen8b_S64_topk20
+  dataset_name: allenai/tulu-3-sft-mixture   # used when use_pregen=false
+  split: validation                          # split for either source
+  sample_max: 4                              # optional cap
+  max_input_len: 4096                        # prompt budget (left-truncated)
+
+specdec:
+  K: 8                                       # proposals per SD block
+  max_new: 64                               # total tokens to generate
+  temperature: 0.0                           # 0 => greedy; >0 => sampling
+  acceptance_cap: 1.0                        # min(1, p/(q*cap))
 
 eval:
-  model_dir: outputs/kd/<run_id>/lora   # <- JUST this; contains cfg.lock.yaml or kd_train.yaml
-  num_samples: 32
-  batch_size: 8
-  K: 8
-  max_new: 128
-  temperature: 0.0
-  acceptance_cap: 1.0
-  compare_with_base: true
-  out_dir: outputs/eval/<run_id>_K8
+  batch_size: 1                              # SD is inherently sequential; keep small
+  out_dir: outputs/eval/sd_qwen3
+  num_prompts: null                          # final cap after loading (null => all)
+  log_every: 1
 
-training:
+runtime:
   seed: 1234
   device: cuda
-  dtype: bf16   # optional; if omitted we use training.dtype from the saved cfg
-
-wandb:
-  project: specdec-two-stage
-  run_name: eval_K8
+  dtype: bf16
+  device_map: auto
+  teacher_8bit: false                        # optional, if you need to save vram
+  draft_use_cache: true                      # enable KV cache in eval for speed
+  teacher_use_cache: true

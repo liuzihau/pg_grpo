@@ -18,22 +18,32 @@ grpo:
   use_pregen_prompts: true
   pregen_dir: data/kd_corpus/qwen8b_S64_topk20
   pregen_split: grpo              # or validation
-  offset_strategy: stride        # "uniform" | "stride"
+  offset_strategy: uniform        # "uniform" | "stride"
   offset_stride: 8               # 0, 8, 16, ... up to cont_len-1
   cushion: 8                  # reserved tokens (guard room)
-  
+
+  valid_every: 200              # run validation every N steps
+  valid_use_pregen_prompts: true   # default = same as train if omitted
+  valid_pregen_split: validation   # pregen split for val
+  valid_hf_split: validation       # HF split for val (when not using pregen)
+  valid_sample_max: 512            # cap #validation prompts (null = all)
+  valid_batch_size: 1              # keep tiny; we force group_size=1 anyway
+  valid_temperature: null          # null => use training temperature
+  valid_acceptance_cap: null       # null => use training cap
+
+
   # train related
   reward_key: accepted_tokens
   batch_size: 1
-  group_size: 8               # GRPO: samples per prompt
-  total_steps: 4000
+  group_size: 12               # GRPO: samples per prompt
+  total_steps: 10000
   lr: 5.0e-5
   weight_decay: 0.0
   betas: [0.9, 0.95]
   warmup_ratio: 0.05
   min_lr: 0.0
   max_new: 8 #128
-  temperature: 1.5  # 0.8
+  temperature: 0.8
   acceptance_cap: 1.0
   grad_accum_steps: 2
   log_every: 1
@@ -43,8 +53,8 @@ grpo:
   teacher_device: "auto"        # or "cpu"
   teacher_8bit: false
   # regularization
-  kl_ref: teacher             # teacher | draft_init | none
-  kl_coeff: 0.01
+  kl_ref: draft_init             # teacher | draft_init | none
+  kl_coeff: 0.1
   print_layers: true
 
 training:

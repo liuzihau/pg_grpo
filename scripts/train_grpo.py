@@ -218,6 +218,183 @@ def teacher_logps_for_sampled_tokens_stepwise(
 
     return t_logp, mask
 
+# -------------------------------- validation -----------------------------------
+def _build_val_loader(cfg, tokenizer):
+    """Create a validation DataLoader that mirrors the training source."""
+    use_pregen_val = bool(cfg_get(cfg, "grpo.valid_use_pregen_prompts",
+                           cfg_get(cfg, "grpo.use_pregen_prompts", False)))
+
+    if use_pregen_val:
+        ds_root = Path(cfg.grpo.pregen_dir).expanduser().resolve()
+        pregen_split = str(cfg_get(cfg, "grpo.valid_pregen_split",
+                            cfg_get(cfg, "grpo.pregen_split", "validation")))
+        ds = PreGeneratedTopKDataset(ds_root, split=pregen_split)
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        def _collate(batch):
+            return collate_grpo_prefixes(
+                batch=batch,
+                tokenizer=tokenizer,
+                pad_id=pad_id,
+                max_input_len=int(cfg.data.max_input_len),
+                max_new_tokens=int(cfg.grpo.max_new),
+                offset_strategy=str(cfg_get(cfg, "grpo.offset_strategy", "uniform")),
+                offset_stride=int(cfg_get(cfg, "grpo.offset_stride", 8)),
+                cushion=int(cfg_get(cfg, "grpo.cushion", 8)),
+                seed=None,
+            )
+
+        dl = DataLoader(
+            ds,
+            batch_size=int(cfg_get(cfg, "grpo.valid_batch_size",
+                            cfg_get(cfg, "grpo.batch_size", 1))),
+            shuffle=False,
+            num_workers=int(cfg_get(cfg, "grpo.num_workers", 2)),
+            pin_memory=True,
+            persistent_workers=False,
+            collate_fn=_collate,
+            drop_last=False,
+        )
+        return dl, False  # use_hf_text_prompts_val=False
+    else:
+        # HF text prompts path
+        split = str(cfg_get(cfg, "grpo.valid_hf_split", "validation"))
+        prompts = load_prompts_for_split(tokenizer, cfg, split=split)
+        if not prompts:
+            train_prompts, val_prompts = make_manual_splits(tokenizer, cfg, seed=int(cfg.training.seed))
+            prompts = val_prompts
+        sample_max = cfg_get(cfg, "grpo.valid_sample_max", None)
+        if sample_max:
+            prompts = prompts[: int(sample_max)]
+        ds = PromptDataset(prompts)
+        dl = DataLoader(
+            ds,
+            batch_size=int(cfg_get(cfg, "grpo.valid_batch_size",
+                            cfg_get(cfg, "grpo.batch_size", 1))),
+            shuffle=False,
+            num_workers=int(cfg_get(cfg, "grpo.num_workers", 2)),
+            pin_memory=True,
+            drop_last=False,
+        )
+        return dl, True  # use_hf_text_prompts_val=True
+
+
+@torch.no_grad()
+def _run_validation_once(
+    *,
+    draft,
+    teacher,
+    tokenizer,
+    val_loader,
+    use_hf_text_prompts_val: bool,
+    cfg,
+    device: torch.device,
+    reward_key: str,
+) -> Dict[str, float]:
+    """Run validation with group_size=1 and return averaged reward metrics."""
+    draft.eval()
+    teacher.eval()
+
+    max_new = int(cfg.grpo.max_new)
+    temperature = float(cfg_get(cfg, "grpo.valid_temperature",
+                         cfg_get(cfg, "grpo.temperature", 1.0)))
+    cap = float(cfg_get(cfg, "grpo.valid_acceptance_cap",
+                  cfg_get(cfg, "grpo.acceptance_cap", 1.0)))
+
+    processed = 0
+    cap_samples = cfg_get(cfg, "grpo.valid_sample_max", None)
+    if cap_samples is not None:
+        cap_samples = int(cap_samples)
+
+    reward_sum = 0.0
+    alpha_sum  = 0.0
+    ats_sum    = 0.0
+    valid_tok_sum = 0.0
+    n_samples = 0
+
+    for batch in val_loader:
+        if use_hf_text_prompts_val:
+            # strings → tokenize like in train (left-pad)
+            prep_prompts = _prepare_prompts(
+                tokenizer, batch, max_input_len=int(cfg.data.max_input_len), S=max_new
+            )
+            prompt_ids, prompt_attn, pr_lens, pad_id = _tokenize_prompts(
+                tokenizer, prep_prompts, max_input_len=int(cfg.data.max_input_len)
+            )
+        else:
+            # pregen collate result
+            prompt_ids = batch["prompt_ids"]
+            prompt_attn = batch["prompt_attn"]
+            pr_lens = batch["prompt_attn"].sum(dim=1).tolist()
+            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        # group_size=1 for validation
+        eos_id = tokenizer.eos_token_id
+        seqs, rep_pr_lens = _sample_group(
+            draft, tokenizer, prompt_ids, prompt_attn,
+            group_size=1, max_new=max_new,
+            temperature=temperature, eos_id=eos_id
+        )
+
+        # draft logp (no grad)
+        att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long().to(device)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+        d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
+            out.logits, seqs.to(device), rep_pr_lens, max_new=max_new,
+            pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id)
+        )
+        if gen_mask_NT.sum().item() == 0:
+            continue
+
+        # teacher logp (step-wise KV)
+        t_logp_NT, t_mask_NT = teacher_logps_for_sampled_tokens_stepwise(
+            teacher=teacher,
+            seqs=seqs.to(device),
+            pr_lens=rep_pr_lens,
+            pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+            max_new=max_new,
+            device=device,
+            microbatch=int(cfg_get(cfg, "grpo.teacher_microbatch", 8)),
+        )
+
+        valid_mask = ((gen_mask_NT > 0) & (t_mask_NT > 0)).to(d_logp_NT.dtype)
+        rewards = expected_alpha_and_goodput_from_logps(
+            draft_logp=d_logp_NT,
+            teacher_logp=t_logp_NT,
+            mask=valid_mask,
+            acceptance_cap=cap,
+        )
+
+        if reward_key == "alpha":
+            r = rewards["alpha_mean"]
+        elif reward_key == "accepted_tokens":
+            r = rewards["accepted_tokens"]
+        else:
+            raise NotImplementedError(f"Unknown reward_key: {reward_key}")
+
+        B_now = r.numel()
+        reward_sum   += float(r.sum().detach().cpu())
+        alpha_sum    += float(rewards["alpha_mean"].sum().detach().cpu())
+        ats_sum      += float(rewards["accepted_tokens"].sum().detach().cpu())
+        valid_tok_sum+= float(rewards["valid_tokens"].sum().detach().cpu())
+        n_samples    += B_now
+        processed    += B_now
+
+        if cap_samples is not None and processed >= cap_samples:
+            break
+
+    if n_samples == 0:
+        return {"valid/reward": 0.0, "valid/alpha_mean": 0.0,
+                "valid/accepted_tokens": 0.0, "valid/valid_tokens": 0.0}
+
+    return {
+        "valid/reward":           reward_sum / n_samples,
+        "valid/alpha_mean":       alpha_sum / n_samples,
+        "valid/accepted_tokens":  ats_sum / n_samples,
+        "valid/valid_tokens":     valid_tok_sum / n_samples,
+        "valid/samples":          float(n_samples),
+    }
 
 
 
@@ -423,6 +600,13 @@ def main():
         use_hf_text_prompts = True
 
 
+    do_valid = int(cfg_get(cfg, "grpo.valid_every", 0)) > 0
+    if do_valid:
+        val_loader, use_hf_text_prompts_val = _build_val_loader(cfg, tokenizer)
+    else:
+        val_loader, use_hf_text_prompts_val = None, False
+
+
     # ------- Optim & schedule (train only LoRA params) -------
     optim = build_adamw(
         draft,
@@ -606,6 +790,38 @@ def main():
                              ats=f"{logs['grpo/accepted_tokens']:.3f}",
                              alpha=f"{logs['grpo/alpha_mean']:.3f}")
 
+        # ---- periodic validation
+        if do_valid and ((step + 1) % int(cfg.grpo.valid_every) == 0):
+            draft.eval()   # make sure no dropout etc.
+            with torch.no_grad():
+                val_stats = _run_validation_once(
+                    draft=draft,
+                    teacher=teacher,
+                    tokenizer=tokenizer,
+                    val_loader=val_loader,
+                    use_hf_text_prompts_val=use_hf_text_prompts_val,
+                    cfg=cfg,
+                    device=device,
+                    reward_key=str(cfg_get(cfg, "grpo.reward_key", "alpha")).lower(),
+                )
+            # log + progress text
+            wandb_log(val_stats, step=step)
+            pbar.set_postfix_str(
+                f"{pbar.postfix} | v/rew={val_stats['valid/reward']:.3f} "
+                f"v/α={val_stats['valid/alpha_mean']:.3f} v/ats={val_stats['valid/accepted_tokens']:.2f}"
+            )
+            draft.train()
+
+        if step % 2000 == 0:
+            # ------- Save adapters + summary -------
+            outdir = out_dir.with_name(out_dir.name + f"-step-{step}") / "lora"
+            outdir.mkdir(parents=True, exist_ok=True)
+            try:
+                draft.save_pretrained(str(outdir))
+            except Exception:
+                torch.save(draft.state_dict(), outdir / "pytorch_model.bin")
+
+
     # ------- Save adapters + summary -------
     outdir = out_dir / "lora"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -631,3 +847,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
