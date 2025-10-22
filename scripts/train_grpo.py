@@ -815,7 +815,7 @@ def main():
             )
             draft.train()
 
-        if (step + 1) % acc_steps == 0:
+        if (step + 1) % kl_ref_update_every == 0:
             # ------- Save adapters + summary -------
             outdir = out_dir.with_name(out_dir.name + f"-step-{step}") / "lora"
             outdir.mkdir(parents=True, exist_ok=True)
@@ -824,14 +824,9 @@ def main():
             except Exception:
                 torch.save(draft.state_dict(), outdir / "pytorch_model.bin")
 
-            torch.nn.utils.clip_grad_norm_(draft.parameters(), grad_clip)
-            optim.step()
-            sched.step()
-            optim.zero_grad(set_to_none=True)
-
-    # ---- periodic ref_model refresh (for kl_ref == "draft_init")
-    if kl_ref == "draft_init" and kl_ref_update_every > 0 and ((step + 1) % kl_ref_update_every == 0):
-        _hard_refresh_ref_model_(ref_model, draft)
+        # ---- periodic ref_model refresh (for kl_ref == "draft_init")
+        if kl_ref == "draft_init" and kl_ref_update_every > 0 and ((step + 1) % kl_ref_update_every == 0):
+            _hard_refresh_ref_model_(ref_model, draft)
 
     # ------- Save adapters + summary -------
     outdir = out_dir / "lora"
