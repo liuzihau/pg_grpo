@@ -129,7 +129,7 @@ def _gather_token_logps_from_forward(
     T = float(max(1e-6, logprob_temp))
 
     # compute in float32 for numerical stability, with the SAME temperature used to sample
-    logp_full = F.log_softmax((logits.float() / T), dim=-1)  # [N,L,V] fp32
+    logp_full = F.log_softmax((logits / T), dim=-1)  # [N,L,V] fp32
 
     out_logp = torch.zeros((N, int(max_new)), dtype=logp_full.dtype, device=device)
     mask = torch.zeros((N, int(max_new)), dtype=logp_full.dtype, device=device)
