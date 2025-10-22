@@ -237,7 +237,7 @@ def _build_val_loader(cfg, tokenizer):
                 pad_id=pad_id,
                 max_input_len=int(cfg.data.max_input_len),
                 max_new_tokens=int(cfg.grpo.max_new),
-                offset_strategy=str(cfg_get(cfg, "grpo.offset_strategy", "uniform")),
+                offset_strategy=str(cfg_get(cfg, "grpo.valid_offset_strategy", "uniform")),
                 offset_stride=int(cfg_get(cfg, "grpo.offset_stride", 8)),
                 cushion=int(cfg_get(cfg, "grpo.cushion", 8)),
                 seed=None,

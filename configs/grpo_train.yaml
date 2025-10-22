@@ -26,6 +26,7 @@ grpo:
   valid_use_pregen_prompts: true   # default = same as train if omitted
   valid_pregen_split: validation   # pregen split for val
   valid_hf_split: validation       # HF split for val (when not using pregen)
+  valid_offset_strategy: fix
   valid_sample_max: 512            # cap #validation prompts (null = all)
   valid_batch_size: 1              # keep tiny; we force group_size=1 anyway
   valid_temperature: null          # null => use training temperature

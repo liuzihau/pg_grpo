@@ -56,8 +56,10 @@ def collate_grpo_prefixes(
         cont_ids:   List[int] = list(rec["cont_ids"])
         cont_len:   int       = int(rec["cont_len"])
         cont_lens.append(cont_len)
-
-        o = _choose_offset(cont_len, strategy=offset_strategy, stride=offset_stride, rng=rng)
+        if offset_strategy == "fix":
+            o = 32
+        else:
+            o = _choose_offset(cont_len, strategy=offset_strategy, stride=offset_stride, rng=rng)
         prefix = prompt_ids + cont_ids[:o]
         if len(prefix) > budget:
             prefix = prefix[-budget:]
