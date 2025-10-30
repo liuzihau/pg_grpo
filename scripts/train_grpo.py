@@ -125,34 +125,38 @@ def _gather_token_logps_from_forward(
     pr_lens: List[int],      # len N
     max_new: int,
     pad_id: int,
-    logprob_temp: float = 1.0,              # <--- NEW
+    logprob_temp: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    N, L, V = logits.shape
+    N, Ltot, V = logits.shape
     device = logits.device
-    T = float(max(1e-6, logprob_temp))
+    T = int(max_new)
+    temp = float(max(1e-6, logprob_temp))
 
-    # compute in float32 for numerical stability, with the SAME temperature used to sample
-    logp_full = F.log_softmax((logits / T), dim=-1)  # [N,L,V] fp32
-
-    out_logp = torch.zeros((N, int(max_new)), dtype=logp_full.dtype, device=device)
-    mask = torch.zeros((N, int(max_new)), dtype=logp_full.dtype, device=device)
+    # log-softmax with gradient preserved
+    logp_all = F.log_softmax(logits.float() / temp, dim=-1)  # [N,L,V]
 
     att = (seqs != pad_id).long()
-    seq_lens = att.sum(dim=1)
-    pr_lens_t = torch.tensor(pr_lens, device=device, dtype=torch.long)
-    gen_lens = (seq_lens - pr_lens_t).clamp(min=0, max=int(max_new))
+    seq_lens = att.sum(dim=1)                  # [N]
+    pr = torch.tensor(pr_lens, device=device)  # [N]
+    gen_lens = (seq_lens - pr).clamp(min=0, max=T)  # [N]
 
-    for i in range(N):
-        g = int(gen_lens[i])
-        if g <= 0: continue
-        p = int(pr_lens[i])
-        pos = torch.arange(g, device=device)
-        logits_idx = p - 1 + pos
-        tgt_ids = seqs[i, p + pos]
-        out_logp[i, :g] = logp_full[i, logits_idx, tgt_ids]
-        mask[i, :g] = 1.0
+    t = torch.arange(T, device=device).unsqueeze(0).expand(N, T)        # [N,T]
+    valid_mask = (t < gen_lens.unsqueeze(1)).float()                    # [N,T]
 
-    return out_logp, mask
+    # positions for next-token logits (use last prompt token + t)
+    pos_logits = (pr - 1).unsqueeze(1) + t                              # [N,T]
+    pos_logits_clamped = pos_logits.clamp(min=0, max=Ltot - 1)
+
+    # target token ids at the generated positions
+    pos_targets = pr.unsqueeze(1) + t                                   # [N,T]
+    pos_targets_clamped = pos_targets.clamp(min=0, max=Ltot - 1)
+    tgt_ids = seqs.gather(1, pos_targets_clamped)                       # [N,T]
+
+    # gather next-token log-probs for those target ids
+    logp_next = logp_all.gather(1, pos_logits_clamped.unsqueeze(-1).expand(-1, -1, V))  # [N,T,V]
+    out_logp = logp_next.gather(2, tgt_ids.unsqueeze(-1)).squeeze(-1)   # [N,T]
+
+    return out_logp, valid_mask
 
 # ---- drop-in helper (uses teacher with KV cache, tiny memory) ----
 def _gather_full_next_logprobs_from_forward(
@@ -162,46 +166,35 @@ def _gather_full_next_logprobs_from_forward(
     max_new: int,
     pad_id: int,
     logprob_temp: float | None = None,
-    to_cpu: bool = False,
+    to_cpu: bool = False,    # WARNING: keep False during training that needs grads
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Extract full next-token log-probs at each generated step:
-      return logp_full [N,T,V], mask [N,T]
-    where for step t we take logits at position (prompt_len - 1 + t).
-    """
     N, Ltot, V = logits.shape
     device = logits.device
     T = int(max_new)
     temp = float(logprob_temp) if logprob_temp is not None else 1.0
 
-    # fp32 for stability; place outputs on CPU if requested
-    target_device = torch.device("cpu") if to_cpu else device
-    out = torch.empty((N, T, V), dtype=torch.float32, device=target_device)
-    mask = torch.zeros((N, T), dtype=torch.float32, device=target_device)
-
-    # stable log-softmax
-    logp_all = F.log_softmax(logits.float() / temp, dim=-1)  # [N,Ltot,V]
-
+    logp_all = F.log_softmax(logits.float() / temp, dim=-1)             # [N,L,V]
     att = (seqs != pad_id).long()
     seq_lens = att.sum(dim=1)
-    pr_lens_t = torch.tensor(pr_lens, device=device, dtype=torch.long)
-    gen_lens = (seq_lens - pr_lens_t).clamp(min=0, max=T)
+    pr = torch.tensor(pr_lens, device=device)
+    gen_lens = (seq_lens - pr).clamp(min=0, max=T)
 
-    for i in range(N):
-        g = int(gen_lens[i])
-        if g <= 0:
-            continue
-        p = int(pr_lens[i])
-        pos = torch.arange(g, device=device)
-        logits_idx = p - 1 + pos  # next-token positions
-        # move slices to target device if needed
-        slice_i = logp_all[i, logits_idx]  # [g, V] on logits.device
-        if to_cpu and slice_i.device.type != "cpu":
-            slice_i = slice_i.cpu()
-        out[i, :g, :] = slice_i
-        mask[i, :g] = 1.0
+    t = torch.arange(T, device=device).unsqueeze(0).expand(N, T)        # [N,T]
+    valid_mask = (t < gen_lens.unsqueeze(1)).float()                    # [N,T]
 
-    return out, mask
+    pos_logits = (pr - 1).unsqueeze(1) + t
+    pos_logits = pos_logits.clamp(min=0, max=Ltot - 1)                  # [N,T]
+
+    # gather the full next-token log-probs at those positions (preserves grad)
+    logp_full = logp_all.gather(
+        1, pos_logits.unsqueeze(-1).expand(-1, -1, V)
+    )                                                                    # [N,T,V]
+
+    if to_cpu:  # only for evaluation; do NOT use when you need gradients
+        logp_full = logp_full.cpu()
+        valid_mask = valid_mask.cpu()
+
+    return logp_full, valid_mask
 
 
 @torch.no_grad()
@@ -571,6 +564,9 @@ def main():
     kl_loss_coeff = float(cfg_get(cfg, "grpo.kl_loss_coeff", 1.0))
     full_dist_microbatch = int(cfg_get(cfg, "grpo.full_dist_microbatch", 4))
     full_dist_cpu_offload = bool(cfg_get(cfg, "grpo.full_dist_cpu_offload", True))
+    if train_mode == "kl" and full_dist_cpu_offload:
+        print("[warn] full_dist_cpu_offload=True disables grads; forcing False for KL mode.")
+        full_dist_cpu_offload = False
     overlap_topk = cfg_get(cfg, "grpo.overlap_topk", None)
     if overlap_topk is not None:
         overlap_topk = int(overlap_topk)
