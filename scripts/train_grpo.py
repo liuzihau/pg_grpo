@@ -615,6 +615,26 @@ def main():
         train_cfg, used_cfg_path = kd_cfg, kd_model_dir / "cfg.lock.yaml"
         stage_kind = "kd"
 
+    # ---- ensure draft has trainable params (LoRA) ----
+    # Some loaders return a fully-frozen eval model; we must re-enable LoRA grads.
+    try:
+        n_train, n_total = mark_only_lora_trainable(draft)
+    except Exception:
+        # fallback: enable any PEFT adapter layers if available
+        if hasattr(draft, "enable_adapter_layers"):
+            draft.enable_adapter_layers()
+        # re-run to count
+        n_train, n_total = mark_only_lora_trainable(draft)
+
+    print(f"[trainable] {n_train:,} / {n_total:,} params require_grad on draft")
+    assert n_train > 0, (
+        "No trainable parameters found on draft. "
+        "Likely the loader merged adapters or returned a fully-frozen eval model. "
+        "Make sure LoRA adapters are attached and active."
+    )
+
+    draft.train()
+
 
     # ---- teacher memory policy ----
     td = str(cfg_get(cfg, "grpo.teacher_device", "auto")).lower()
@@ -1002,6 +1022,22 @@ def main():
             raise ValueError(f"Unknown train_mode: {train_mode}")
 
 
+        # Sanity checks just before (loss/acc_steps).backward()
+        with torch.no_grad():
+            some_grad = any(p.requires_grad for p in draft.parameters())
+        print(f"[sanity] any(draft.param.requires_grad)={some_grad}")
+        assert some_grad, "Draft has zero trainable parameters"
+
+        # out.logits is created above in this iteration
+        assert hasattr(out, "logits") and out.logits.requires_grad, \
+            "draft forward produced logits without grad; parameters are probably frozen"
+
+        # For KL mode ensure q_full is on GPU and has grad:
+        if train_mode == "kl":
+            assert 'q_full' in locals() and q_full.requires_grad and q_full.device.type == 'cuda', \
+                "KL mode needs q_full with grad on CUDA; check offload and gather path"
+
+        assert loss.requires_grad, "Loss is not connected to the graph"
         (loss / acc_steps).backward()
 
         if (step + 1) % acc_steps == 0:
@@ -1092,7 +1128,7 @@ def main():
             "base_model_dir": str(kd_model_dir),
             "out_dir": str(outdir),
             "kl_ref": kl_ref,
-            "reward_key": reward_key,
+            "reward_key": reward_key_cfg,
         },
         out_dir / "train_summary.json",
     )
