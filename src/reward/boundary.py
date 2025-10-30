@@ -124,7 +124,6 @@ def alpha_from_full_distributions(
     return expected_span_from_alpha(overlap, mask)
 
 
-@torch.no_grad()
 def kl_from_full_distributions(
     *,
     q_logp_full: torch.Tensor,   # [N,T,V]

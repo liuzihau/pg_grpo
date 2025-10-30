@@ -1011,7 +1011,6 @@ def main():
                 q_logp_full=q_full, p_logp_full=p_full, mask=valid_mask_full,
                 direction=kl_direction
             )
-            pol_loss = torch.zeros((), device=d_logp_NT.device)  # not used
             kl_loss = kl_loss_coeff * kl_stats["kl_mean"].mean()
             loss = kl_loss  # no policy term
 
@@ -1021,23 +1020,6 @@ def main():
         else:
             raise ValueError(f"Unknown train_mode: {train_mode}")
 
-
-        # Sanity checks just before (loss/acc_steps).backward()
-        with torch.no_grad():
-            some_grad = any(p.requires_grad for p in draft.parameters())
-        print(f"[sanity] any(draft.param.requires_grad)={some_grad}")
-        assert some_grad, "Draft has zero trainable parameters"
-
-        # out.logits is created above in this iteration
-        assert hasattr(out, "logits") and out.logits.requires_grad, \
-            "draft forward produced logits without grad; parameters are probably frozen"
-
-        # For KL mode ensure q_full is on GPU and has grad:
-        if train_mode == "kl":
-            assert 'q_full' in locals() and q_full.requires_grad and q_full.device.type == 'cuda', \
-                "KL mode needs q_full with grad on CUDA; check offload and gather path"
-
-        assert loss.requires_grad, "Loss is not connected to the graph"
         (loss / acc_steps).backward()
 
         if (step + 1) % acc_steps == 0:
