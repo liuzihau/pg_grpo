@@ -31,11 +31,14 @@ from src.data.prompts import load_prompts_for_split, make_manual_splits, truncat
 from src.training.optim import build_adamw
 from src.training.schedule import make_warmup_cosine
 from src.training.move import move_to_device_non_blocking
-from src.reward.boundary import expected_alpha_and_goodput_from_logps
-
+from src.reward.boundary import (
+    expected_alpha_and_goodput_from_logps,
+    expected_span_from_alpha,          # new
+    alpha_from_full_distributions,     # new
+    kl_from_full_distributions,        # new
+)
 
 # ---------------------------- small prompt dataset ----------------------------
-
 class PromptDataset(Dataset):
     def __init__(self, prompts: List[str]):
         self.prompts = prompts
@@ -152,6 +155,131 @@ def _gather_token_logps_from_forward(
     return out_logp, mask
 
 # ---- drop-in helper (uses teacher with KV cache, tiny memory) ----
+def _gather_full_next_logprobs_from_forward(
+    logits: torch.Tensor,    # [N, Ltot, V]
+    seqs: torch.Tensor,      # [N, Ltot]
+    pr_lens: list[int],      # len N
+    max_new: int,
+    pad_id: int,
+    logprob_temp: float | None = None,
+    to_cpu: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extract full next-token log-probs at each generated step:
+      return logp_full [N,T,V], mask [N,T]
+    where for step t we take logits at position (prompt_len - 1 + t).
+    """
+    N, Ltot, V = logits.shape
+    device = logits.device
+    T = int(max_new)
+    temp = float(logprob_temp) if logprob_temp is not None else 1.0
+
+    # fp32 for stability; place outputs on CPU if requested
+    target_device = torch.device("cpu") if to_cpu else device
+    out = torch.empty((N, T, V), dtype=torch.float32, device=target_device)
+    mask = torch.zeros((N, T), dtype=torch.float32, device=target_device)
+
+    # stable log-softmax
+    logp_all = F.log_softmax(logits.float() / temp, dim=-1)  # [N,Ltot,V]
+
+    att = (seqs != pad_id).long()
+    seq_lens = att.sum(dim=1)
+    pr_lens_t = torch.tensor(pr_lens, device=device, dtype=torch.long)
+    gen_lens = (seq_lens - pr_lens_t).clamp(min=0, max=T)
+
+    for i in range(N):
+        g = int(gen_lens[i])
+        if g <= 0:
+            continue
+        p = int(pr_lens[i])
+        pos = torch.arange(g, device=device)
+        logits_idx = p - 1 + pos  # next-token positions
+        # move slices to target device if needed
+        slice_i = logp_all[i, logits_idx]  # [g, V] on logits.device
+        if to_cpu and slice_i.device.type != "cpu":
+            slice_i = slice_i.cpu()
+        out[i, :g, :] = slice_i
+        mask[i, :g] = 1.0
+
+    return out, mask
+
+
+@torch.no_grad()
+def teacher_full_next_logprobs_stepwise(
+    teacher,
+    seqs: torch.Tensor,          # [N, L_out] left-padded: prompt + generated
+    pr_lens: list[int],          # len N
+    pad_id: int,
+    max_new: int,
+    device: torch.device | str,
+    microbatch: int = 4,
+    logprob_temp: float | None = None,
+    to_cpu: bool = True,
+):
+    """
+    Build step-wise teacher cache and collect FULL next-token log-probs.
+    Returns:
+      logp_full [N,T,V], mask [N,T]
+    """
+    device = torch.device(device)
+    teacher = teacher.to(device).eval()
+
+    N, L = seqs.shape
+    T = int(max_new)
+    temp = float(logprob_temp) if logprob_temp is not None else 1.0
+
+    # pre-allocate (optionally on CPU)
+    # we probe V lazily on first step
+    out_full = None
+    mask = torch.zeros((N, T), dtype=torch.float32, device="cpu" if to_cpu else device)
+
+    # process by small slices of N to bound memory
+    for s in range(0, N, microbatch):
+        e = min(s + microbatch, N)
+        for i in range(s, e):
+            seq = seqs[i].to(device, non_blocking=True)
+            p = int(pr_lens[i])
+            valid_len = int((seq != pad_id).sum().item()) - p
+            g = max(0, min(valid_len, T))
+            if g == 0:
+                continue
+
+            prompt = seq[:p].unsqueeze(0)
+            att_pr = (prompt != pad_id).long()
+            out_pr = teacher(input_ids=prompt, attention_mask=att_pr, use_cache=True)
+            past = out_pr.past_key_values
+
+            prev = seq[p-1].view(1,1)
+            # lazy allocate with known V
+            if out_full is None:
+                with torch.no_grad():
+                    probe = teacher(input_ids=prev, use_cache=True, past_key_values=past)
+                    V = int(probe.logits.size(-1))
+                out_full = torch.empty(
+                    (N, T, V), dtype=torch.float32,
+                    device="cpu" if to_cpu else device
+                )
+
+            for t in range(g):
+                out_t = teacher(input_ids=prev, use_cache=True, past_key_values=past)
+                logits_last = out_t.logits[:, -1, :]   # [1,V]
+                logp = F.log_softmax(logits_last.float() / temp, dim=-1)  # [1,V]
+                if to_cpu and logp.device.type != "cpu":
+                    logp = logp.cpu()
+                out_full[i, t, :] = logp.squeeze(0)
+                mask[i, t] = 1.0
+
+                past = out_t.past_key_values
+                prev = seq[p + t].view(1,1)
+
+    # if nothing generated at all, allocate degenerate
+    if out_full is None:
+        # probe V from teacher embeddings if necessary
+        V = teacher.get_output_embeddings().weight.size(0)
+        out_full = torch.empty((N, T, V), dtype=torch.float32, device="cpu" if to_cpu else device)
+
+    return out_full, mask
+
 @torch.no_grad()
 def teacher_logps_for_sampled_tokens_stepwise(
     teacher,
@@ -289,8 +417,13 @@ def _run_validation_once(
     cfg,
     device: torch.device,
     reward_key: str,
+    acceptance_source: str,         # <--- NEW
+    logprob_temp: float,            # <--- NEW
+    full_dist_microbatch: int,      # <--- NEW
+    full_dist_cpu_offload: bool,    # <--- NEW
+    overlap_topk: int | None,       # <--- NEW
 ) -> Dict[str, float]:
-    """Run validation with group_size=1 and return averaged reward metrics."""
+    """Run validation with group_size=1 and return averaged metrics."""
     draft.eval()
     teacher.eval()
 
@@ -313,7 +446,6 @@ def _run_validation_once(
 
     for batch in val_loader:
         if use_hf_text_prompts_val:
-            # strings → tokenize like in train (left-pad)
             prep_prompts = _prepare_prompts(
                 tokenizer, batch, max_input_len=int(cfg.data.max_input_len), S=max_new
             )
@@ -321,13 +453,11 @@ def _run_validation_once(
                 tokenizer, prep_prompts, max_input_len=int(cfg.data.max_input_len)
             )
         else:
-            # pregen collate result
             prompt_ids = batch["prompt_ids"]
             prompt_attn = batch["prompt_attn"]
             pr_lens = batch["prompt_attn"].sum(dim=1).tolist()
             pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
-        # group_size=1 for validation
         eos_id = tokenizer.eos_token_id
         seqs, rep_pr_lens = _sample_group(
             draft, tokenizer, prompt_ids, prompt_attn,
@@ -335,51 +465,75 @@ def _run_validation_once(
             temperature=temperature, eos_id=eos_id
         )
 
-        # draft logp (no grad)
+        # common masks
         att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long().to(device)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
-        d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
-            out.logits, seqs.to(device), rep_pr_lens,
-            max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
-            logprob_temp=temperature,                  # use grpo.valid_temperature or train temp
-        )
-        if gen_mask_NT.sum().item() == 0:
-            continue
 
-        # teacher logp (step-wise KV)
-        t_logp_NT, t_mask_NT = teacher_logps_for_sampled_tokens_stepwise(
-            teacher=teacher,
-            seqs=seqs.to(device),
-            pr_lens=rep_pr_lens,
-            pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
-            max_new=max_new,
-            device=device,
-            microbatch=int(cfg_get(cfg, "grpo.teacher_microbatch", 8)),
-        )
-
-        valid_mask = ((gen_mask_NT > 0) & (t_mask_NT > 0)).to(d_logp_NT.dtype)
-        rewards = expected_alpha_and_goodput_from_logps(
-            draft_logp=d_logp_NT,
-            teacher_logp=t_logp_NT,
-            mask=valid_mask,
-            acceptance_cap=cap,
-        )
+        if acceptance_source == "full_overlap":
+            # draft full
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+            q_full, q_mask = _gather_full_next_logprobs_from_forward(
+                out.logits, seqs.to(device), rep_pr_lens,
+                max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                logprob_temp=logprob_temp, to_cpu=full_dist_cpu_offload
+            )
+            # teacher full
+            p_full, p_mask = teacher_full_next_logprobs_stepwise(
+                teacher=teacher,
+                seqs=seqs.to(device),
+                pr_lens=rep_pr_lens,
+                pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                max_new=max_new,
+                device=device,
+                microbatch=full_dist_microbatch,
+                logprob_temp=logprob_temp,
+                to_cpu=full_dist_cpu_offload,
+            )
+            valid_mask = ((q_mask > 0) & (p_mask > 0)).to(q_full.dtype)
+            stats = alpha_from_full_distributions(
+                q_logp_full=q_full, p_logp_full=p_full, mask=valid_mask,
+                acceptance_cap=cap, topk=overlap_topk
+            )
+        else:
+            # sampled ratio (legacy)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+            d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
+                out.logits, seqs.to(device), rep_pr_lens,
+                max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                logprob_temp=temperature,
+            )
+            t_logp_NT, t_mask_NT = teacher_logps_for_sampled_tokens_stepwise(
+                teacher=teacher,
+                seqs=seqs.to(device),
+                pr_lens=rep_pr_lens,
+                pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                max_new=max_new,
+                device=device,
+                microbatch=full_dist_microbatch,
+            )
+            valid_mask = ((gen_mask_NT > 0) & (t_mask_NT > 0)).to(d_logp_NT.dtype)
+            stats = expected_alpha_and_goodput_from_logps(
+                draft_logp=d_logp_NT,
+                teacher_logp=t_logp_NT,
+                mask=valid_mask,
+                acceptance_cap=cap,
+            )
 
         if reward_key == "alpha":
-            r = rewards["alpha_mean"]
+            r = stats["alpha_mean"]
         elif reward_key == "accepted_tokens":
-            r = rewards["accepted_tokens"]
+            r = stats["accepted_tokens"]
         else:
             raise NotImplementedError(f"Unknown reward_key: {reward_key}")
 
         B_now = r.numel()
-        reward_sum   += float(r.sum().detach().cpu())
-        alpha_sum    += float(rewards["alpha_mean"].sum().detach().cpu())
-        ats_sum      += float(rewards["accepted_tokens"].sum().detach().cpu())
-        valid_tok_sum+= float(rewards["valid_tokens"].sum().detach().cpu())
-        n_samples    += B_now
-        processed    += B_now
+        reward_sum    += float(r.sum().detach().cpu())
+        alpha_sum     += float(stats["alpha_mean"].sum().detach().cpu())
+        ats_sum       += float(stats["accepted_tokens"].sum().detach().cpu())
+        valid_tok_sum += float(stats["valid_tokens"].sum().detach().cpu())
+        n_samples     += B_now
+        processed     += B_now
 
         if cap_samples is not None and processed >= cap_samples:
             break
@@ -397,8 +551,6 @@ def _run_validation_once(
     }
 
 
-
-
 # ----------------------------------- main -------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -411,6 +563,21 @@ def main():
     raw = load_yaml_with_includes(args.config)
     cfg = to_attrdict(apply_overrides(raw, parse_overrides(args.override)))
     set_seed(int(cfg.training.seed))
+
+    # ----- New training mode & distribution settings -----
+    train_mode = str(cfg_get(cfg, "grpo.train_mode", "policy")).lower()             # "policy" | "kl"
+    acceptance_source = str(cfg_get(cfg, "grpo.acceptance_source", "sampled_ratio")).lower()  # "sampled_ratio" | "full_overlap"
+    kl_direction = str(cfg_get(cfg, "grpo.kl_direction", "q||p")).lower()           # only for train_mode=kl
+    kl_loss_coeff = float(cfg_get(cfg, "grpo.kl_loss_coeff", 1.0))
+    full_dist_microbatch = int(cfg_get(cfg, "grpo.full_dist_microbatch", 4))
+    full_dist_cpu_offload = bool(cfg_get(cfg, "grpo.full_dist_cpu_offload", True))
+    overlap_topk = cfg_get(cfg, "grpo.overlap_topk", None)
+    if overlap_topk is not None:
+        overlap_topk = int(overlap_topk)
+
+    reward_key_cfg = str(cfg_get(cfg, "grpo.reward_key", "alpha_mean")).lower()
+    checkpoint_every = int(cfg_get(cfg, "grpo.checkpoint_every",
+                           cfg_get(cfg, "grpo.kl_ref_update_every", 0)))
 
     out_dir = Path(cfg.grpo.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -639,6 +806,13 @@ def main():
     device = torch.device(cfg_get(cfg, "training.device", "cuda"))
     max_new = int(cfg.grpo.max_new)
     temperature = float(cfg.grpo.temperature)
+    # temperature used when converting logits -> log-probs for q/p full distributions
+    logprob_temp = cfg_get(cfg, "grpo.logprob_temp", None)
+    if logprob_temp is None:
+        logprob_temp = temperature   # fall back to sampling temp
+    else:
+        logprob_temp = float(logprob_temp)
+
     cap = float(cfg.grpo.acceptance_cap)
     group_size = int(cfg.grpo.group_size)
     grad_clip = float(cfg.training.get("max_grad_norm", 1.0))
@@ -707,7 +881,7 @@ def main():
             pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
             max_new=max_new,
             device=device,
-            microbatch=int(cfg_get(cfg, "grpo.teacher_microbatch", 8)),
+            microbatch=full_dist_microbatch,
         )
         
         # 4) Optional ref logprobs for KL
@@ -722,52 +896,116 @@ def main():
         else:
             ref_logp_NT = None
 
-        # 5) Rewards from expected acceptance / goodput
-        valid_mask = ((gen_mask_NT > 0) & (t_mask_NT > 0)).to(d_logp_NT.dtype)
-        rewards = expected_alpha_and_goodput_from_logps(
-            draft_logp=d_logp_NT.detach(),
-            teacher_logp=t_logp_NT,
-            mask=valid_mask,
-            acceptance_cap=cap,
-        )
+        # -------------------- REWARD & LOSS (two modes) --------------------
+        if train_mode == "policy":
+            if acceptance_source == "full_overlap":
+                # --- full distribution overlap path ---
+                # Build q_full and p_full (log-probs over V for next-token positions)
+                q_full, q_mask = _gather_full_next_logprobs_from_forward(
+                    out.logits, seqs.to(device), rep_pr_lens,
+                    max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                    logprob_temp=logprob_temp, to_cpu=full_dist_cpu_offload
+                )
+                p_full, p_mask = teacher_full_next_logprobs_stepwise(
+                    teacher=teacher,
+                    seqs=seqs.to(device),
+                    pr_lens=rep_pr_lens,
+                    pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                    max_new=max_new,
+                    device=device,
+                    microbatch=full_dist_microbatch,
+                    logprob_temp=logprob_temp,
+                    to_cpu=full_dist_cpu_offload,
+                )
+                valid_mask_full = ((q_mask > 0) & (p_mask > 0)).to(q_full.dtype)
+                stats = alpha_from_full_distributions(
+                    q_logp_full=q_full, p_logp_full=p_full, mask=valid_mask_full,
+                    acceptance_cap=cap, topk=overlap_topk
+                )
+            else:
+                # --- legacy sampled-token ratio path ---
+                valid_mask = ((gen_mask_NT > 0) & (t_mask_NT > 0)).to(d_logp_NT.dtype)
+                stats = expected_alpha_and_goodput_from_logps(
+                    draft_logp=d_logp_NT.detach(),   # ok to detach for reward
+                    teacher_logp=t_logp_NT,
+                    mask=valid_mask,
+                    acceptance_cap=cap,
+                )
 
-        # scalar per-sample reward used by GRPO
-        reward_key = str(cfg_get(cfg, "grpo.reward_key", "alpha_mean")).lower()
-        if reward_key == "alpha":
-            r_N = rewards["alpha_mean"]
-        elif reward_key == "accepted_tokens":
-            r_N = rewards["accepted_tokens"]
+            # scalar per-sample reward used by GRPO
+            reward_key = str(cfg_get(cfg, "grpo.reward_key", "alpha_mean")).lower()
+            if reward_key == "alpha":
+                r_N = stats["alpha_mean"]
+            elif reward_key == "accepted_tokens":
+                r_N = stats["accepted_tokens"]
+            else:
+                raise NotImplementedError()
+
+            # Group baseline & normalised advantages
+            B = prompt_ids.size(0)
+            G = group_size
+            assert B * G == N, (B, G, N)
+            r_BG = r_N.view(B, G)
+            base_B = r_BG.mean(dim=1, keepdim=True)
+            adv_BG = (r_BG - base_B)
+            adv_N = adv_BG.view(N)
+
+            adv_mean = adv_N.mean()
+            adv_std  = adv_N.std().clamp_min(1e-3)
+            adv_N = (adv_N - adv_mean) / adv_std
+            adv_N = adv_N.clamp(-5.0, 5.0)
+
+            # policy loss (mask by valid tokens count)
+            valid_t  = (stats["valid_tokens"].to(d_logp_NT.device)).clamp_min(1.0)  # [N]
+            sum_logpi = (d_logp_NT * ((gen_mask_NT > 0).to(d_logp_NT.dtype))).sum(dim=1)
+            pol_loss = -(adv_N.detach() * (sum_logpi / valid_t)).mean()
+
+            # optional KL regulariser (skip if using teacher as the supervised target elsewhere)
+            if ref_logp_NT is not None and kl_coeff > 0:
+                kl_per_t = (d_logp_NT - ref_logp_NT) * gen_mask_NT
+                kl_term = kl_per_t.sum(dim=1) / valid_t
+                kl_loss = kl_coeff * kl_term.mean()
+            else:
+                kl_loss = torch.zeros((), device=d_logp_NT.device)
+
+            loss = pol_loss + kl_loss
+
+        elif train_mode == "kl":
+            # --------- pure supervised KL on on-policy samples (no GRPO) ----------
+            # Build full distributions for q/p
+            q_full, q_mask = _gather_full_next_logprobs_from_forward(
+                out.logits, seqs.to(device), rep_pr_lens,
+                max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                logprob_temp=logprob_temp, to_cpu=full_dist_cpu_offload
+            )
+            p_full, p_mask = teacher_full_next_logprobs_stepwise(
+                teacher=teacher,
+                seqs=seqs.to(device),
+                pr_lens=rep_pr_lens,
+                pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                max_new=max_new,
+                device=device,
+                microbatch=full_dist_microbatch,
+                logprob_temp=logprob_temp,
+                to_cpu=full_dist_cpu_offload,
+            )
+            valid_mask_full = ((q_mask > 0) & (p_mask > 0)).to(q_full.dtype)
+
+            kl_stats = kl_from_full_distributions(
+                q_logp_full=q_full, p_logp_full=p_full, mask=valid_mask_full,
+                direction=kl_direction
+            )
+            pol_loss = torch.zeros((), device=d_logp_NT.device)  # not used
+            kl_loss = kl_loss_coeff * kl_stats["kl_mean"].mean()
+            loss = kl_loss  # no policy term
+
+            # turn off any old KL-regulariser in this mode to avoid double counting
+            ref_logp_NT = None
+
         else:
-            raise NotImplementedError()
+            raise ValueError(f"Unknown train_mode: {train_mode}")
 
-        # 6) Group Relative baseline (mean within each prompt-group)
-        B = prompt_ids.size(0)
-        G = group_size
-        assert B * G == N, (B, G, N)
-        r_BG = r_N.view(B, G)
-        base_B = r_BG.mean(dim=1, keepdim=True)           # [B,1]
-        adv_BG = (r_BG - base_B)                           # [B,G]
-        adv_N = adv_BG.view(N)
 
-        adv_mean = adv_N.mean()
-        adv_std  = adv_N.std().clamp_min(1e-3)
-        adv_N = (adv_N - adv_mean) / adv_std
-        adv_N = adv_N.clamp(-5.0, 5.0)          # optional, prevents extreme updates
-
-        # Policy loss = - E[adv * sum_t logpi_t / valid_t]
-        valid_t  = valid_mask.sum(dim=1).clamp_min(1.0)
-        sum_logpi = (d_logp_NT * valid_mask).sum(dim=1)
-        pol_loss = -(adv_N.detach() * (sum_logpi / valid_t)).mean()
-
-        # KL control (optional)
-        if ref_logp_NT is not None and kl_coeff > 0:
-            kl_per_t = (d_logp_NT - ref_logp_NT) * gen_mask_NT  # E_{pi} log pi/ref
-            kl_term = kl_per_t.sum(dim=1) / valid_t
-            kl_loss = kl_coeff * kl_term.mean()
-        else:
-            kl_loss = torch.zeros((), device=d_logp_NT.device)
-
-        loss = pol_loss + kl_loss
         (loss / acc_steps).backward()
 
         if (step + 1) % acc_steps == 0:
@@ -780,18 +1018,29 @@ def main():
         if step % print_every == 0:
             logs = {
                 "grpo/loss": float(loss.detach().cpu()),
-                "grpo/policy_loss": float(pol_loss.detach().cpu()),
-                "grpo/kl_loss": float(kl_loss.detach().cpu()),
                 "grpo/lr": sched.get_last_lr()[0],
-                "grpo/alpha_mean": float(rewards["alpha_mean"].mean().detach().cpu()),
-                "grpo/accepted_tokens": float(rewards["accepted_tokens"].mean().detach().cpu()),
-                # "grpo/reject_rate": float(rewards["reject_rate"].mean().detach().cpu()),
-                "grpo/mean_len": float(valid_t.mean().detach().cpu()),
+                "grpo/mean_len": float(((gen_mask_NT > 0).sum(dim=1).float().mean()).detach().cpu()),
             }
+            if train_mode == "policy":
+                logs.update({
+                    "grpo/policy_loss": float(pol_loss.detach().cpu()),
+                    "grpo/kl_loss": float(kl_loss.detach().cpu()),
+                    "grpo/alpha_mean": float(stats["alpha_mean"].mean().detach().cpu()),
+                    "grpo/accepted_tokens": float(stats["accepted_tokens"].mean().detach().cpu()),
+                })
+            else:  # kl
+                logs.update({
+                    "kl/mean": float(kl_stats["kl_mean"].mean().detach().cpu()),
+                })
             wandb_log(logs, step=step)
-            pbar.set_postfix(loss=f"{logs['grpo/loss']:.3f}",
-                             ats=f"{logs['grpo/accepted_tokens']:.3f}",
-                             alpha=f"{logs['grpo/alpha_mean']:.3f}")
+            if train_mode == "policy":
+                pbar.set_postfix(loss=f"{logs['grpo/loss']:.3f}",
+                                 ats=f"{logs['grpo/accepted_tokens']:.3f}",
+                                 alpha=f"{logs['grpo/alpha_mean']:.3f}")
+            else:
+                pbar.set_postfix(loss=f"{logs['grpo/loss']:.3f}",
+                                 kl=f"{logs['kl/mean']:.3f}")
+
 
         # ---- periodic validation
         if do_valid and ((step + 1) % int(cfg.grpo.valid_every) == 0):
@@ -805,7 +1054,12 @@ def main():
                     use_hf_text_prompts_val=use_hf_text_prompts_val,
                     cfg=cfg,
                     device=device,
-                    reward_key=str(cfg_get(cfg, "grpo.reward_key", "alpha")).lower(),
+                    reward_key=reward_key_cfg,
+                    acceptance_source=acceptance_source,
+                    logprob_temp=logprob_temp,
+                    full_dist_microbatch=full_dist_microbatch,
+                    full_dist_cpu_offload=full_dist_cpu_offload,
+                    overlap_topk=overlap_topk,
                 )
             # log + progress text
             wandb_log(val_stats, step=step)
@@ -815,8 +1069,7 @@ def main():
             )
             draft.train()
 
-        if (step + 1) % kl_ref_update_every == 0:
-            # ------- Save adapters + summary -------
+        if checkpoint_every > 0 and ((step + 1) % checkpoint_every == 0):
             outdir = out_dir.with_name(out_dir.name + f"-step-{step}") / "lora"
             outdir.mkdir(parents=True, exist_ok=True)
             try:
@@ -824,9 +1077,9 @@ def main():
             except Exception:
                 torch.save(draft.state_dict(), outdir / "pytorch_model.bin")
 
-        # ---- periodic ref_model refresh (for kl_ref == "draft_init")
-        if kl_ref == "draft_init" and kl_ref_update_every > 0 and ((step + 1) % kl_ref_update_every == 0):
+        if train_mode == "policy" and kl_ref == "draft_init" and kl_ref_update_every > 0 and ((step + 1) % kl_ref_update_every == 0):
             _hard_refresh_ref_model_(ref_model, draft)
+
 
     # ------- Save adapters + summary -------
     outdir = out_dir / "lora"

@@ -1,14 +1,16 @@
-# src/reward/boundary.py
 from __future__ import annotations
-from typing import Dict, Optional
+from typing import Dict, Optional, Literal
 import torch
 import torch.nn.functional as F
 
 __all__ = [
-    "expected_alpha_and_goodput_from_logps",   # (kept) token-wise ratio path
-    "alpha_overlap_from_teacher_topk",         # (new) top-K overlap path
+    "expected_alpha_and_goodput_from_logps",   # (kept) sampled-token ratio path
+    "expected_span_from_alpha",                # (new) alpha_t -> span
+    "alpha_from_full_distributions",           # (new) overlap on full dists
+    "kl_from_full_distributions",              # (new) per-step KL (+ mean)
 ]
 
+@torch.no_grad()
 def expected_alpha_and_goodput_from_logps(
     *,
     draft_logp: torch.Tensor,     # [N,T] log q(y_t) on the sampled tokens
@@ -17,7 +19,7 @@ def expected_alpha_and_goodput_from_logps(
     acceptance_cap: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """
-    SD-consistent stats.
+    SD-consistent stats on the *sampled tokens only*:
       alpha_t(y_t) = min(1, p(y_t) / (cap * q(y_t))).
     'accepted_tokens' is the expected accepted span:
         E[L] = sum_t prod_{j<=t} alpha_j
@@ -33,113 +35,126 @@ def expected_alpha_and_goodput_from_logps(
 
     draft_logp = draft_logp.float()
     teacher_logp = teacher_logp.float()
-    mask = torch.ones_like(draft_logp) if mask is None else (mask > 0).to(draft_logp.dtype)
 
-    # per-token acceptance on sampled tokens
     log_cap = float(torch.log(torch.tensor(acceptance_cap, device=device, dtype=draft_logp.dtype)))
     log_ratio = teacher_logp - draft_logp - log_cap
     alpha_token = torch.exp(log_ratio).clamp(max=1.0)                # [N,T]
 
-    # --- strictly exclude padded steps from any tokenwise aggregates
-    alpha_masked = alpha_token * mask                                # [N,T]
+    return expected_span_from_alpha(alpha_token, mask)
+
+
+@torch.no_grad()
+def expected_span_from_alpha(
+    alpha_token: torch.Tensor,   # [N,T]
+    mask: torch.Tensor,          # [N,T] float {0,1}
+) -> Dict[str, torch.Tensor]:
+    """Utility shared by both paths: alpha_t → mean alpha + expected span (masked)."""
+    alpha_token = alpha_token.float()
+    mask = (mask > 0).to(alpha_token.dtype)
 
     # tokenwise averages (diagnostic)
     valid = mask.sum(dim=1).clamp_min(1.0)                           # [N]
-    alpha_sum = alpha_masked.sum(dim=1)                               # [N]
+    alpha_sum = (alpha_token * mask).sum(dim=1)                       # [N]
     alpha_mean = alpha_sum / valid                                    # [N]
 
-    # SD expected span: sum_t prod_{j<=t} alpha_j
-    # For padded steps, we set alpha=1 so they don't truncate the product.
+    # SD expected span: sum_t prod_{j<=t} alpha_j; for pads, set alpha=1
     alpha_eff = torch.where(mask > 0, alpha_token, torch.ones_like(alpha_token))
     cp = torch.cumprod(alpha_eff.clamp_min(1e-6), dim=1)             # [N,T]
     expected_span = (cp * mask).sum(dim=1)                            # [N]
 
-    # rejects = (valid - expected_span)
-    # goodput = expected_span / (1.0 + rejects).clamp_min(1e-6)
-    # reject_rate = 1.0 - (expected_span / valid)
-
     return {
-        "alpha_token": alpha_token,        # [N,T] (raw per-step alpha)
-        "alpha_mean": alpha_mean,          # [N]   mean alpha over valid steps only
-        "accepted_tokens": expected_span,  # [N]   expected accepted span (use this)
+        "alpha_token": alpha_token,        # [N,T]
+        "alpha_mean": alpha_mean,          # [N]
+        "accepted_tokens": expected_span,  # [N]
         "valid_tokens": valid,             # [N]
-        # "goodput": goodput,                # [N]
-        # "reject_rate": reject_rate,        # [N]
-        # "alpha_sum": alpha_sum,            # [N]   optional diagnostic
     }
 
 
 @torch.no_grad()
-def alpha_overlap_from_teacher_topk(
+def alpha_from_full_distributions(
     *,
-    draft_logits: torch.Tensor,                # [N,T,V] logits on the *T steps of interest*
-    teacher_topk_ids: torch.Tensor,            # [N,T,K] token ids from teacher (pregen KD)
-    teacher_topk_logprobs: torch.Tensor,       # [N,T,K] log p(x) from teacher on those ids
-    mask: Optional[torch.Tensor] = None,       # [N,T] 1=valid, 0=padded
+    q_logp_full: torch.Tensor,     # [N,T,V] log q_t(v)
+    p_logp_full: torch.Tensor,     # [N,T,V] log p_t(v)
+    mask: torch.Tensor,            # [N,T] float {0,1}
     acceptance_cap: float = 1.0,
-    sample_span: bool = True,
+    topk: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Distribution-overlap acceptance (probabilistic SD):
-      alpha_t = sum_x min(q_t(x), p_t(x)/cap).
-    We approximate the sum using teacher top-K tokens (and add a conservative tail term).
-    Returns per-step alpha, a sampled accepted span (or expected), and goodput-ish metrics.
-
-    This path avoids a teacher forward during GRPO if you use pregen KD teacher top-K.
+    Full-distribution overlap:
+      alpha_t = sum_v min(q_t(v), p_t(v))  in probability space.
+    If topk is provided, we approximate with the union top-K per (N,T), plus
+    a single "other" bucket for the remaining mass (lower-bounded overlap).
     """
-    N, T, V = draft_logits.shape
-    device = draft_logits.device
-    if mask is None:
-        mask = torch.ones((N, T), dtype=draft_logits.dtype, device=device)
+    assert q_logp_full.shape == p_logp_full.shape
+    N, T, V = q_logp_full.shape
+    device = q_logp_full.device
 
-    # Draft probs on the teacher's top-K ids (enough for a good lower bound of overlap)
-    logq_full = F.log_softmax(draft_logits, dim=-1)                         # [N,T,V]
-    ids = teacher_topk_ids.to(device=device, dtype=torch.long)              # [N,T,K]
-    logq_top = torch.gather(logq_full, dim=-1, index=ids)                   # [N,T,K]
-    q_top = logq_top.exp()                                                  # [N,T,K]
+    # probs in fp32
+    q = torch.exp(q_logp_full.float())
+    p = torch.exp(p_logp_full.float())
 
-    # Teacher probs (already log) -> scale by 1/cap for the acceptance rule
-    logp_top = teacher_topk_logprobs.to(device=device, dtype=torch.float32) # [N,T,K]
-    p_top = (logp_top.exp() / float(acceptance_cap))                        # [N,T,K]
-
-    # Overlap on the covered tokens
-    overlap_top = torch.minimum(q_top, p_top).sum(dim=-1)                   # [N,T]
-
-    # Tail masses we didn't enumerate (conservative lower-bound overlap adds min of tails)
-    q_tail = (1.0 - q_top.sum(dim=-1)).clamp_min(0.0)                       # [N,T]
-    p_tail = (1.0 - p_top.sum(dim=-1)).clamp_min(0.0)                       # [N,T]
-    alpha = (overlap_top + torch.minimum(q_tail, p_tail)).clamp(0.0, 1.0)   # [N,T]
-
-    # Respect valid-token mask: treat invalid steps as alpha=1 so they don't stop the span
-    alpha_eff = torch.where(mask > 0, alpha, torch.ones_like(alpha))
-
-    # Expected accepted span for a K-step proposal: E[L] = sum_i prod_{j<=i} alpha_j
-    cp = torch.cumprod(alpha_eff.clamp_min(1e-6), dim=1)                    # [N,T]
-    exp_span = (cp * mask).sum(dim=1)                                       # [N]
-
-    # Monte Carlo sampled span via u ~ U(0,1)
-    if sample_span:
-        u = torch.rand_like(alpha)
-        # accept decisions only on valid steps; invalid => force-accept to not truncate span
-        accept = torch.where(mask > 0, (u < alpha).to(alpha.dtype), torch.ones_like(alpha))
-        pref = torch.cumprod(accept, dim=1)                                  # 1.. until first 0, then 0..
-        span = (pref * mask).sum(dim=1)                                      # [N]
+    if topk is None or topk >= V:
+        overlap = torch.minimum(q, p).sum(dim=-1)    # [N,T]
     else:
-        span = exp_span
+        # union topK approximation (lower bound)
+        k = min(int(topk), V)
+        qk_vals, qk_idx = torch.topk(q, k, dim=-1)                  # [N,T,k]
+        pk_vals, pk_idx = torch.topk(p, k, dim=-1)                  # [N,T,k]
+        # build union indices
+        union_idx = torch.concat([qk_idx, pk_idx], dim=-1)          # [N,T,2k]
+        union_idx = torch.unique(union_idx, dim=-1)                 # [N,T,<=2k]
 
-    valid = mask.sum(dim=1).clamp_min(1.0)
-    alpha_mean = (alpha * mask).sum(dim=1) / valid
-    rejects = (valid - span)
-    goodput = span / (1.0 + rejects).clamp_min(1e-6)
-    reject_rate = 1.0 - (span / valid)
+        # gather selected masses
+        gather_shape = union_idx.shape
+        take = union_idx.reshape(N*T, -1)
+        q_take = q.reshape(N*T, V).gather(1, take).reshape(gather_shape)  # [N,T,M]
+        p_take = p.reshape(N*T, V).gather(1, take).reshape(gather_shape)
+
+        head_overlap = torch.minimum(q_take, p_take).sum(dim=-1)    # [N,T]
+        q_head = q_take.sum(dim=-1)
+        p_head = p_take.sum(dim=-1)
+        # Compress tail into a single bucket (lower bound on true overlap in tail)
+        tail_overlap = torch.minimum(1.0 - q_head, 1.0 - p_head)
+        overlap = head_overlap + tail_overlap                        # [N,T]
+
+    # optional cap (behaves like sampled-ratio cap)
+    if acceptance_cap is not None and acceptance_cap > 0:
+        overlap = (overlap / float(acceptance_cap)).clamp(max=1.0)
+
+    return expected_span_from_alpha(overlap, mask)
+
+
+@torch.no_grad()
+def kl_from_full_distributions(
+    *,
+    q_logp_full: torch.Tensor,   # [N,T,V]
+    p_logp_full: torch.Tensor,   # [N,T,V]
+    mask: torch.Tensor,          # [N,T] float {0,1}
+    direction: Literal["q||p", "p||q"] = "q||p",
+) -> Dict[str, torch.Tensor]:
+    """
+    Token-wise KL over the full vocabulary (masked), then mean over valid steps.
+    Returns per-sample kl_mean [N] for direct supervised optimisation.
+    """
+    assert q_logp_full.shape == p_logp_full.shape
+    q_logp_full = q_logp_full.float()
+    p_logp_full = p_logp_full.float()
+    mask = (mask > 0).to(q_logp_full.dtype)
+
+    if direction == "q||p":
+        q = torch.exp(q_logp_full)
+        kl_t = (q * (q_logp_full - p_logp_full)).sum(dim=-1)  # [N,T]
+    elif direction == "p||q":
+        p = torch.exp(p_logp_full)
+        kl_t = (p * (p_logp_full - q_logp_full)).sum(dim=-1)  # [N,T]
+    else:
+        raise ValueError(f"Unknown KL direction: {direction}")
+
+    valid = mask.sum(dim=1).clamp_min(1.0)                    # [N]
+    kl_mean = (kl_t * mask).sum(dim=1) / valid                # [N]
 
     return {
-        "alpha_token": alpha,        # [N,T]
-        "accepted_span": span,       # [N] sampled (or expected if sample_span=False)
-        "expected_span": exp_span,   # [N]
-        "alpha_mean": alpha_mean,    # [N]
-        "goodput": goodput,          # [N]
-        "reject_rate": reject_rate,  # [N]
-        "accepted_tokens": span,     # [N]
-        "valid_tokens": valid,       # [N]
+        "kl_token": kl_t,     # [N,T]
+        "kl_mean": kl_mean,   # [N]
+        "valid_tokens": valid # [N]
     }

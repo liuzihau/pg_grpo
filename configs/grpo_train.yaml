@@ -34,6 +34,21 @@ grpo:
 
 
   # train related
+  # training mode
+  train_mode: policy           # policy | kl
+  acceptance_source: sampled_ratio   # sampled_ratio | full_overlap
+
+  # KL-supervised mode (when train_mode=kl)
+  kl_direction: q||p           # q||p | p||q
+  kl_loss_coeff: 1.0
+
+  # building full distributions
+  logprob_temp: null           # null => use sampling temperature
+  full_dist_microbatch: 4
+  full_dist_cpu_offload: true
+  overlap_topk: null           # e.g., 512 for union-topK approx (optional)
+
+
   reward_key: accepted_tokens
   batch_size: 1
   group_size: 8               # GRPO: samples per prompt
@@ -48,7 +63,6 @@ grpo:
   acceptance_cap: 1.0
   grad_accum_steps: 2
   log_every: 1
-  teacher_device: cpu         # "auto" (default GPU) or "cpu" to fully offload teacher
   teacher_8bit: false         # set true if you have bitsandbytes and want GPU 8-bit teacher
   teacher_microbatch: 8
   teacher_device: "auto"      # or "cpu"
@@ -56,9 +70,10 @@ grpo:
   # regularization
   kl_ref: draft_init          # teacher | draft_init | none
   kl_ref_update_every: 1000   # <-- H steps; 0 disables refresh
-
   kl_coeff: 0.1
   print_layers: true
+
+  checkpoint_every: 1000   # steps; set to 0 to disable  
 
 training:
   seed: 1234
