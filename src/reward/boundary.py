@@ -128,21 +128,38 @@ def alpha_from_full_distributions(
 def kl_from_full_distributions(
     *, q_logp_full, p_logp_full, mask, direction="q||p", eps: float = 1e-8
 ):
-    q_logp_full = torch.nan_to_num(q_logp_full.float(), neginf=-1e9, posinf=1e9)
-    p_logp_full = torch.nan_to_num(p_logp_full.float(), neginf=-1e9, posinf=1e9)
-    mask = (mask > 0).to(q_logp_full.dtype)
+    # 1) upcast + sanitize
+    logq = q_logp_full.float()
+    logp = p_logp_full.float()
 
-    # clamp probs to [eps, 1]
-    q = torch.exp(q_logp_full).clamp_min(eps)
-    p = torch.exp(p_logp_full).clamp_min(eps)
+    # Replace NaNs/+inf/-inf with large negative (never positive).
+    neg_big = -1e9
+    logq = torch.where(torch.isfinite(logq), logq, torch.full_like(logq, neg_big))
+    logp = torch.where(torch.isfinite(logp), logp, torch.full_like(logp, neg_big))
+
+    # 2) force them to be valid log-probabilities (row-wise normalisation)
+    #    This also guarantees all entries <= 0 and rows sum to 1 after exp.
+    logq = logq - torch.logsumexp(logq, dim=-1, keepdim=True)
+    logp = logp - torch.logsumexp(logp, dim=-1, keepdim=True)
+
+    # 3) compute KL in log-space (only need probs for q)
+    q = torch.exp(logq)  # stable now (sums to 1, no inf)
 
     if direction == "q||p":
-        kl_t = (q * (torch.log(q) - torch.log(p))).sum(dim=-1)
+        kl_t = (q * (logq - logp)).sum(dim=-1)
     elif direction == "p||q":
-        kl_t = (p * (torch.log(p) - torch.log(q))).sum(dim=-1)
+        p = torch.exp(logp)
+        kl_t = (p * (logp - logq)).sum(dim=-1)
     else:
         raise ValueError(f"Unknown KL direction: {direction}")
 
-    valid = mask.sum(dim=1).clamp_min(1.0)
-    kl_mean = (kl_t * mask).sum(dim=1) / valid
+    # 4) time masking with safe denominator
+    m = (mask > 0).to(kl_t.dtype)
+    valid = m.sum(dim=1).clamp_min(1.0)
+    kl_mean = (kl_t * m).sum(dim=1) / valid
+
+    # 5) belt-and-braces: remove any stragglers
+    kl_t = torch.nan_to_num(kl_t, nan=0.0, posinf=0.0, neginf=0.0)
+    kl_mean = torch.nan_to_num(kl_mean, nan=0.0, posinf=0.0, neginf=0.0)
+
     return {"kl_token": kl_t, "kl_mean": kl_mean, "valid_tokens": valid}
