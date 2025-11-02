@@ -124,36 +124,25 @@ def alpha_from_full_distributions(
     return expected_span_from_alpha(overlap, mask)
 
 
+# src/reward/boundary.py
 def kl_from_full_distributions(
-    *,
-    q_logp_full: torch.Tensor,   # [N,T,V]
-    p_logp_full: torch.Tensor,   # [N,T,V]
-    mask: torch.Tensor,          # [N,T] float {0,1}
-    direction: Literal["q||p", "p||q"] = "q||p",
-) -> Dict[str, torch.Tensor]:
-    """
-    Token-wise KL over the full vocabulary (masked), then mean over valid steps.
-    Returns per-sample kl_mean [N] for direct supervised optimisation.
-    """
-    assert q_logp_full.shape == p_logp_full.shape
-    q_logp_full = q_logp_full.float()
-    p_logp_full = p_logp_full.float()
+    *, q_logp_full, p_logp_full, mask, direction="q||p", eps: float = 1e-8
+):
+    q_logp_full = torch.nan_to_num(q_logp_full.float(), neginf=-1e9, posinf=1e9)
+    p_logp_full = torch.nan_to_num(p_logp_full.float(), neginf=-1e9, posinf=1e9)
     mask = (mask > 0).to(q_logp_full.dtype)
 
+    # clamp probs to [eps, 1]
+    q = torch.exp(q_logp_full).clamp_min(eps)
+    p = torch.exp(p_logp_full).clamp_min(eps)
+
     if direction == "q||p":
-        q = torch.exp(q_logp_full)
-        kl_t = (q * (q_logp_full - p_logp_full)).sum(dim=-1)  # [N,T]
+        kl_t = (q * (torch.log(q) - torch.log(p))).sum(dim=-1)
     elif direction == "p||q":
-        p = torch.exp(p_logp_full)
-        kl_t = (p * (p_logp_full - q_logp_full)).sum(dim=-1)  # [N,T]
+        kl_t = (p * (torch.log(p) - torch.log(q))).sum(dim=-1)
     else:
         raise ValueError(f"Unknown KL direction: {direction}")
 
-    valid = mask.sum(dim=1).clamp_min(1.0)                    # [N]
-    kl_mean = (kl_t * mask).sum(dim=1) / valid                # [N]
-
-    return {
-        "kl_token": kl_t,     # [N,T]
-        "kl_mean": kl_mean,   # [N]
-        "valid_tokens": valid # [N]
-    }
+    valid = mask.sum(dim=1).clamp_min(1.0)
+    kl_mean = (kl_t * mask).sum(dim=1) / valid
+    return {"kl_token": kl_t, "kl_mean": kl_mean, "valid_tokens": valid}

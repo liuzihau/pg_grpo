@@ -99,18 +99,35 @@ def _sample_group(
     rep_ids  = prompt_ids.repeat_interleave(group_size, dim=0).contiguous()
     rep_attn = prompt_attn.repeat_interleave(group_size, dim=0).contiguous()
 
-    gen = model.generate(
-        input_ids=rep_ids.to(model.device),
-        attention_mask=rep_attn.to(model.device),
-        do_sample=True,
-        temperature=max(1e-6, float(temperature)),
-        max_new_tokens=int(max_new),
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-        eos_token_id=eos_id,
-        use_cache=True,
-        return_dict_in_generate=True,
-        output_scores=False,  # we'll recompute logprobs with grads later
-    )
+    try:
+        gen = model.generate(
+            input_ids=rep_ids.to(model.device),
+            attention_mask=rep_attn.to(model.device),
+            do_sample=True,
+            temperature=max(1e-6, float(temperature)),
+            max_new_tokens=int(max_new),
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            eos_token_id=eos_id,
+            use_cache=True,
+            return_dict_in_generate=True,
+            output_scores=False,  # we'll recompute logprobs with grads later
+        )
+    except Exception as e:
+        # Fallback: deterministic decode for this batch, or just skip
+        print(f"[warn] sampling failed ({e}); falling back to greedy for this batch")
+        gen = model.generate(do_sample=False,
+            input_ids=rep_ids.to(model.device),
+            attention_mask=rep_attn.to(model.device),
+            do_sample=True,
+            temperature=max(1e-6, float(temperature)),
+            max_new_tokens=int(max_new),
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            eos_token_id=eos_id,
+            use_cache=True,
+            return_dict_in_generate=True,
+            output_scores=False,  # we'll recompute logprobs with grads later
+            )
+        
     seqs = gen.sequences  # [B*G, L_out] (left-padded)
     # prompt lengths replicate G times
     # Derive from attention (1s for tokens incl. prompt); stable since we padded left
@@ -173,6 +190,7 @@ def _gather_full_next_logprobs_from_forward(
     T = int(max_new)
     temp = float(logprob_temp) if logprob_temp is not None else 1.0
 
+    logits = torch.nan_to_num(logits, neginf=-1e4, posinf=1e4)
     logp_all = F.log_softmax(logits.float() / temp, dim=-1)             # [N,L,V]
     att = (seqs != pad_id).long()
     seq_lens = att.sum(dim=1)
@@ -465,6 +483,7 @@ def _run_validation_once(
             # draft full
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+            
             q_full, q_mask = _gather_full_next_logprobs_from_forward(
                 out.logits, seqs.to(device), rep_pr_lens,
                 max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
@@ -491,6 +510,8 @@ def _run_validation_once(
             # sampled ratio (legacy)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+
+            
             d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
                 out.logits, seqs.to(device), rep_pr_lens,
                 max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
@@ -879,6 +900,16 @@ def main():
         att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long().to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+
+        # Bail out gracefully if logits are non-finite
+        if not torch.isfinite(out.logits).all():
+            print("[warn] non-finite logits; skipping step & zeroing grads")
+            optim.zero_grad(set_to_none=True)
+            # (Optional) small LR backoff on instability bursts:
+            for pg in optim.param_groups:
+                pg["lr"] = max(pg["lr"] * 0.5, 1e-6)
+            continue
+        
         d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
             out.logits, seqs.to(device), rep_pr_lens,
             max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
