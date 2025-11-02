@@ -73,9 +73,17 @@ def _tokenize_prompts(tokenizer, prompts: List[str], max_input_len: int):
         prompts, return_tensors=None, padding=False, truncation=True, max_length=max_input_len
     )
     ids_list = enc["input_ids"]
+
+    # --- FIX: ensure no empty sequences (generate() + rope can NaN on fully-padded rows)
+    bos = getattr(tokenizer, "bos_token_id", None)
+    eos = getattr(tokenizer, "eos_token_id", None)
+    fallback = bos if bos is not None else (eos if eos is not None else 0)
+    ids_list = [ids if len(ids) > 0 else [fallback] for ids in ids_list]
+
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     input_ids, attn, lens = _left_pad_batch(ids_list, pad_id=pad_id)
     return input_ids, attn, lens, pad_id
+
 
 def _hard_refresh_ref_model_(ref_model, draft):
     """Overwrite ref_model weights with the current draft (no grads on ref)."""
@@ -102,7 +110,12 @@ def _sample_group(
 # --- NEW: move safely only if not sharded
     ids_in  = _on_right_device_for_generate(model, rep_ids)
     att_in  = _on_right_device_for_generate(model, rep_attn)
-
+    if (att_in.sum(dim=1) == 0).any():
+        bad = (att_in.sum(dim=1) == 0).nonzero(as_tuple=False).view(-1)
+        # pick a safe token to seed generation
+        bos = getattr(tokenizer, "bos_token_id", None) or (tokenizer.eos_token_id or 0)
+        ids_in[bad, -1] = bos
+        att_in[bad, -1] = 1
     try:
         gen = model.generate(
             input_ids=ids_in  ,
@@ -903,6 +916,25 @@ def main():
     draft.train()
     pbar = tqdm(range(int(cfg.grpo.total_steps)), desc="GRPO", ncols=100)
     it = iter(dl)
+
+
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+
+    for m in (draft, teacher):
+        if getattr(m.config, "pad_token_id", None) is None:
+            m.config.pad_token_id = pad_id
+        if getattr(m.config, "eos_token_id", None) is None and eos_id is not None:
+            m.config.eos_token_id = eos_id
+        if bos_id is not None and getattr(m.config, "bos_token_id", None) is None:
+            m.config.bos_token_id = bos_id
+        if hasattr(m, "generation_config"):
+            gc = m.generation_config
+            if getattr(gc, "pad_token_id", None) is None: gc.pad_token_id = m.config.pad_token_id
+            if getattr(gc, "eos_token_id", None) is None and eos_id is not None: gc.eos_token_id = eos_id
+            if bos_id is not None and getattr(gc, "bos_token_id", None) is None: gc.bos_token_id = bos_id
+
 
     for step in pbar:
         try:
