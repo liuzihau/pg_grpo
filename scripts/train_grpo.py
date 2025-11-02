@@ -99,10 +99,14 @@ def _sample_group(
     rep_ids  = prompt_ids.repeat_interleave(group_size, dim=0).contiguous()
     rep_attn = prompt_attn.repeat_interleave(group_size, dim=0).contiguous()
 
+# --- NEW: move safely only if not sharded
+    ids_in  = _on_right_device_for_generate(model, rep_ids)
+    att_in  = _on_right_device_for_generate(model, rep_attn)
+
     try:
         gen = model.generate(
-            input_ids=rep_ids.to(model.device),
-            attention_mask=rep_attn.to(model.device),
+            input_ids=ids_in  ,
+            attention_mask=att_in,
             do_sample=True,
             temperature=max(1e-6, float(temperature)),
             max_new_tokens=int(max_new),
@@ -116,9 +120,8 @@ def _sample_group(
         # Fallback: deterministic decode for this batch, or just skip
         print(f"[warn] sampling failed ({e}); falling back to greedy for this batch")
         gen = model.generate(do_sample=False,
-            input_ids=rep_ids.to(model.device),
-            attention_mask=rep_attn.to(model.device),
-            do_sample=True,
+            input_ids=ids_in,
+            attention_mask=att_in,
             temperature=max(1e-6, float(temperature)),
             max_new_tokens=int(max_new),
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
@@ -176,6 +179,17 @@ def _gather_token_logps_from_forward(
     return out_logp, valid_mask
 
 # ---- drop-in helper (uses teacher with KV cache, tiny memory) ----
+def _on_right_device_for_generate(model, x):
+    # If the model is sharded (hf_device_map present), leave tensors as-is (CPU ok).
+    # Otherwise put on the single device.
+    if hasattr(model, "hf_device_map") and model.hf_device_map:
+        return x  # let Accelerate dispatch
+    # Some PEFT models hang the base at .base_model; be permissive:
+    dev = getattr(model, "device", None)
+    if dev is None and hasattr(model, "base_model"):
+        dev = getattr(model.base_model, "device", None)
+    return x.to(dev) if dev is not None else x
+
 def _gather_full_next_logprobs_from_forward(
     logits: torch.Tensor,    # [N, Ltot, V]
     seqs: torch.Tensor,      # [N, Ltot]
@@ -898,8 +912,10 @@ def main():
         # 2) Compute draft logprobs on sampled tokens WITH grad
         #    One forward on the full sequences to pull the next-token logits
         att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long().to(device)
+        seqs_in = _on_right_device_for_generate(draft, seqs)
+        att_in  = _on_right_device_for_generate(draft, att)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+            out = draft(input_ids=seqs_in, attention_mask=att_in, use_cache=False)
 
         # Bail out gracefully if logits are non-finite
         if not torch.isfinite(out.logits).all():
