@@ -122,7 +122,6 @@ def _sample_group(
         gen = model.generate(do_sample=False,
             input_ids=ids_in,
             attention_mask=att_in,
-            temperature=max(1e-6, float(temperature)),
             max_new_tokens=int(max_new),
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             eos_token_id=eos_id,
@@ -179,16 +178,45 @@ def _gather_token_logps_from_forward(
     return out_logp, valid_mask
 
 # ---- drop-in helper (uses teacher with KV cache, tiny memory) ----
-def _on_right_device_for_generate(model, x):
-    # If the model is sharded (hf_device_map present), leave tensors as-is (CPU ok).
-    # Otherwise put on the single device.
+def _preferred_input_device(model):
+    """
+    Returns:
+      - torch.device('cuda:X') if all params live on the same single CUDA device
+      - torch.device('cpu')    if model is sharded across multiple devices (or CPU)
+    """
+    # (A) Try hf_device_map first (most reliable)
+    devs = set()
     if hasattr(model, "hf_device_map") and model.hf_device_map:
-        return x  # let Accelerate dispatch
-    # Some PEFT models hang the base at .base_model; be permissive:
-    dev = getattr(model, "device", None)
-    if dev is None and hasattr(model, "base_model"):
-        dev = getattr(model.base_model, "device", None)
-    return x.to(dev) if dev is not None else x
+        for v in model.hf_device_map.values():
+            # v can be int, 'cpu', or 'cuda:X'
+            if isinstance(v, str):
+                devs.add(v)
+            elif isinstance(v, int):
+                devs.add(f"cuda:{v}")
+        # Only one non-CPU device? then choose it
+        non_cpu = [d for d in devs if d != "cpu"]
+        if len(non_cpu) == 1:
+            return torch.device(non_cpu[0])
+        # mixed devices (multi-shard) or CPU-only -> keep CPU
+        return torch.device("cpu")
+
+    # (B) Fallback: inspect parameters
+    p_devs = set()
+    for p in model.parameters():
+        if p.device is not None:
+            p_devs.add(str(p.device))
+            if len(p_devs) > 1:
+                return torch.device("cpu")  # multiple devices => treat as sharded
+    if len(p_devs) == 1:
+        one = next(iter(p_devs))
+        if one.startswith("cuda"):
+            return torch.device(one)
+    return torch.device("cpu")
+
+def _on_right_device_for_generate(model, x: torch.Tensor) -> torch.Tensor:
+    tgt = _preferred_input_device(model)
+    return x if tgt.type == "cpu" else x.to(tgt, non_blocking=True)
+
 
 def _gather_full_next_logprobs_from_forward(
     logits: torch.Tensor,    # [N, Ltot, V]
@@ -491,22 +519,23 @@ def _run_validation_once(
         )
 
         # common masks
-        att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long().to(device)
-
+        att = (seqs != (tokenizer.pad_token_id or tokenizer.eos_token_id)).long()
+        seqs_in = _on_right_device_for_generate(draft, seqs)
+        att_in  = _on_right_device_for_generate(draft, att)
         if acceptance_source == "full_overlap":
             # draft full
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+                out = draft(input_ids=seqs_in, attention_mask=att_in, use_cache=False)
             
             q_full, q_mask = _gather_full_next_logprobs_from_forward(
-                out.logits, seqs.to(device), rep_pr_lens,
+                out.logits, seqs.to(out.logits.device, non_blocking=True), rep_pr_lens,
                 max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
                 logprob_temp=logprob_temp, to_cpu=full_dist_cpu_offload
             )
             # teacher full
             p_full, p_mask = teacher_full_next_logprobs_stepwise(
                 teacher=teacher,
-                seqs=seqs.to(device),
+                seqs=seqs.to(out.logits.device, non_blocking=True),
                 pr_lens=rep_pr_lens,
                 pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
                 max_new=max_new,
@@ -522,18 +551,19 @@ def _run_validation_once(
             )
         else:
             # sampled ratio (legacy)
+            seqs_in = _on_right_device_for_generate(draft, seqs)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = draft(input_ids=seqs.to(device), attention_mask=att, use_cache=False)
+                out = draft(input_ids=seqs_in, attention_mask=att, use_cache=False)
 
             
             d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
-                out.logits, seqs.to(device), rep_pr_lens,
+                out.logits, seqs.to(out.logits.device, non_blocking=True), rep_pr_lens,
                 max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
                 logprob_temp=temperature,
             )
             t_logp_NT, t_mask_NT = teacher_logps_for_sampled_tokens_stepwise(
                 teacher=teacher,
-                seqs=seqs.to(device),
+                seqs=seqs.to(out.logits.device, non_blocking=True),
                 pr_lens=rep_pr_lens,
                 pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
                 max_new=max_new,
@@ -927,7 +957,7 @@ def main():
             continue
         
         d_logp_NT, gen_mask_NT = _gather_token_logps_from_forward(
-            out.logits, seqs.to(device), rep_pr_lens,
+            out.logits, seqs.to(out.logits.device, non_blocking=True), rep_pr_lens,
             max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
             logprob_temp=temperature,                      # <--- IMPORTANT
         )
@@ -939,7 +969,7 @@ def main():
         # 3) Teacher logprobs on the same sampled tokens (no grad, stepwise KV cache)
         t_logp_NT, t_mask_NT = teacher_logps_for_sampled_tokens_stepwise(
             teacher=teacher,
-            seqs=seqs.to(device),          # [N, L_out]
+            seqs=seqs.to(out.logits.device, non_blocking=True),          # [N, L_out]
             pr_lens=rep_pr_lens,           # list[int], same as you pass to draft gather
             pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
             max_new=max_new,
@@ -965,13 +995,13 @@ def main():
                 # --- full distribution overlap path ---
                 # Build q_full and p_full (log-probs over V for next-token positions)
                 q_full, q_mask = _gather_full_next_logprobs_from_forward(
-                    out.logits, seqs.to(device), rep_pr_lens,
+                    out.logits, seqs.to(out.logits.device, non_blocking=True), rep_pr_lens,
                     max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
                     logprob_temp=logprob_temp, to_cpu=full_dist_cpu_offload
                 )
                 p_full, p_mask = teacher_full_next_logprobs_stepwise(
                     teacher=teacher,
-                    seqs=seqs.to(device),
+                    seqs=seqs.to(out.logits.device, non_blocking=True),
                     pr_lens=rep_pr_lens,
                     pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
                     max_new=max_new,
@@ -1037,13 +1067,13 @@ def main():
             # --------- pure supervised KL on on-policy samples (no GRPO) ----------
             # Build full distributions for q/p
             q_full, q_mask = _gather_full_next_logprobs_from_forward(
-                out.logits, seqs.to(device), rep_pr_lens,
+                out.logits, seqs.to(out.logits.device, non_blocking=True), rep_pr_lens,
                 max_new=max_new, pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
                 logprob_temp=logprob_temp, to_cpu=full_dist_cpu_offload
             )
             p_full, p_mask = teacher_full_next_logprobs_stepwise(
                 teacher=teacher,
-                seqs=seqs.to(device),
+                seqs=seqs.to(out.logits.device, non_blocking=True),
                 pr_lens=rep_pr_lens,
                 pad_id=(tokenizer.pad_token_id or tokenizer.eos_token_id),
                 max_new=max_new,
