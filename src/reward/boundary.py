@@ -150,6 +150,11 @@ def kl_from_full_distributions(
     elif direction == "p||q":
         p = torch.exp(logp)
         kl_t = (p * (logp - logq)).sum(dim=-1)
+    elif direction == "merge":
+        p = torch.exp(logp)
+        kl_qp = (p * (logp - logq)).sum(dim=-1)
+        kl_pq = (q * (logq - logp)).sum(dim=-1)
+        kl_t = 0.5 * kl_qp + 0.5 * kl_pq
     else:
         raise ValueError(f"Unknown KL direction: {direction}")
 
